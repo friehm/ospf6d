@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfe.c,v 1.44 2014/11/18 20:54:28 krw Exp $ */
+/*	$OpenBSD: ospfe.c,v 1.50 2016/12/22 22:56:52 jca Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -43,7 +43,7 @@
 #include "log.h"
 
 void		 ospfe_sig_handler(int, short, void *);
-void		 ospfe_shutdown(void);
+__dead void	 ospfe_shutdown(void);
 void		 orig_rtr_lsa_all(struct area *);
 void		 orig_rtr_lsa_area(struct area *);
 struct iface	*find_vlink(struct abr_rtr *);
@@ -93,8 +93,8 @@ ospfe(struct ospfd_conf *xconf, int pipe_parent2ospfe[2], int pipe_ospfe2rde[2],
 		fatalx("control socket setup failed");
 
 	/* create the raw ip socket */
-	if ((xconf->ospf_socket = socket(AF_INET6, SOCK_RAW,
-	    IPPROTO_OSPF)) == -1)
+	if ((xconf->ospf_socket = socket(AF_INET6,
+	    SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_OSPF)) == -1)
 		fatal("error creating raw socket");
 
 	/* set some defaults */
@@ -120,6 +120,7 @@ ospfe(struct ospfd_conf *xconf, int pipe_parent2ospfe[2], int pipe_ospfe2rde[2],
 
 	setproctitle("ospf engine");
 	ospfd_process = PROC_OSPF_ENGINE;
+	log_procname = log_procnames[ospfd_process];
 
 	if (setgroups(1, &pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
@@ -194,11 +195,19 @@ ospfe(struct ospfd_conf *xconf, int pipe_parent2ospfe[2], int pipe_ospfe2rde[2],
 	return (0);
 }
 
-void
+__dead void
 ospfe_shutdown(void)
 {
 	struct area	*area;
 	struct iface	*iface;
+
+	/* close pipes */
+	msgbuf_write(&iev_rde->ibuf.w);
+	msgbuf_clear(&iev_rde->ibuf.w);
+	close(iev_rde->ibuf.fd);
+	msgbuf_write(&iev_main->ibuf.w);
+	msgbuf_clear(&iev_main->ibuf.w);
+	close(iev_main->ibuf.fd);
 
 	/* stop all interfaces and remove all areas */
 	while ((area = LIST_FIRST(&oeconf->area_list)) != NULL) {
@@ -215,11 +224,7 @@ ospfe_shutdown(void)
 	close(oeconf->ospf_socket);
 
 	/* clean up */
-	msgbuf_write(&iev_rde->ibuf.w);
-	msgbuf_clear(&iev_rde->ibuf.w);
 	free(iev_rde);
-	msgbuf_write(&iev_main->ibuf.w);
-	msgbuf_clear(&iev_main->ibuf.w);
 	free(iev_main);
 	free(oeconf);
 	free(pkt_ptr);
@@ -255,11 +260,11 @@ ospfe_dispatch_main(int fd, short event, void *bula)
 	struct imsg		 imsg;
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf = &iev->ibuf;
-	int			 n, stub_changed, shut = 0;
+	int			 n, stub_changed, shut = 0, isvalid, wasvalid;
 	unsigned int		 ifindex;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatal("imsg_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
@@ -273,7 +278,7 @@ ospfe_dispatch_main(int fd, short event, void *bula)
 
 	for (;;) {
 		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("ospfe_dispatch_main: imsg_read error");
+			fatal("ospfe_dispatch_main: imsg_get error");
 		if (n == 0)
 			break;
 
@@ -288,11 +293,19 @@ ospfe_dispatch_main(int fd, short event, void *bula)
 			if (iface == NULL)
 				fatalx("interface lost in ospfe");
 
-			if_update(iface, ifp->mtu, ifp->flags, ifp->media_type,
+			wasvalid = (iface->flags & IFF_UP) &&
+			    LINK_STATE_IS_UP(iface->linkstate);
+
+			if_update(iface, ifp->mtu, ifp->flags, ifp->if_type,
 			    ifp->linkstate, ifp->baudrate);
 
-			if ((iface->flags & IFF_UP) &&
-			    LINK_STATE_IS_UP(iface->linkstate)) {
+			isvalid = (iface->flags & IFF_UP) &&
+			    LINK_STATE_IS_UP(iface->linkstate);
+
+			if (wasvalid == isvalid)
+				break;
+
+			if (isvalid) {
 				if_fsm(iface, IF_EVT_UP);
 				log_warnx("interface %s up", iface->name);
 			} else {
@@ -441,7 +454,7 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 	u_int16_t		 l, age;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatal("imsg_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
@@ -455,7 +468,7 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 
 	for (;;) {
 		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("ospfe_dispatch_rde: imsg_read error");
+			fatal("ospfe_dispatch_rde: imsg_get error");
 		if (n == 0)
 			break;
 

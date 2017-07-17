@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde.c,v 1.63 2015/01/16 06:40:19 deraadt Exp $ */
+/*	$OpenBSD: rde.c,v 1.69 2016/12/27 17:18:56 jca Exp $ */
 
 /*
  * Copyright (c) 2004, 2005 Claudio Jeker <claudio@openbsd.org>
@@ -42,7 +42,7 @@
 #define MINIMUM(a, b)	(((a) < (b)) ? (a) : (b))
 
 void		 rde_sig_handler(int sig, short, void *);
-void		 rde_shutdown(void);
+__dead void	 rde_shutdown(void);
 void		 rde_dispatch_imsg(int, short, void *);
 void		 rde_dispatch_parent(int, short, void *);
 void		 rde_dump_area(struct area *, int, pid_t);
@@ -59,11 +59,11 @@ int		 rde_req_list_exists(struct rde_nbr *, struct lsa_hdr *);
 void		 rde_req_list_del(struct rde_nbr *, struct lsa_hdr *);
 void		 rde_req_list_free(struct rde_nbr *);
 
-struct lsa	*rde_asext_get(struct rroute *);
-struct lsa	*rde_asext_put(struct rroute *);
+struct lsa	*rde_asext_get(struct kroute *);
+struct lsa	*rde_asext_put(struct kroute *);
 
 int		 comp_asext(struct lsa *, struct lsa *);
-struct lsa	*orig_asext_lsa(struct rroute *, u_int16_t);
+struct lsa	*orig_asext_lsa(struct kroute *, u_int16_t);
 struct lsa	*orig_sum_lsa(struct rt_node *, struct area *, u_int8_t, int);
 struct lsa	*orig_intra_lsa_net(struct area *, struct iface *,
 		 struct vertex *);
@@ -143,6 +143,7 @@ rde(struct ospfd_conf *xconf, int pipe_parent2rde[2], int pipe_ospfe2rde[2],
 
 	setproctitle("route decision engine");
 	ospfd_process = PROC_RDE_ENGINE;
+	log_procname = log_procnames[ospfd_process];
 
 	if (setgroups(1, &pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
@@ -206,10 +207,16 @@ rde(struct ospfd_conf *xconf, int pipe_parent2rde[2], int pipe_ospfe2rde[2],
 	return (0);
 }
 
-void
+__dead void
 rde_shutdown(void)
 {
 	struct area	*a;
+
+	/* close pipes */
+	msgbuf_clear(&iev_ospfe->ibuf.w);
+	close(iev_ospfe->ibuf.fd);
+	msgbuf_clear(&iev_main->ibuf.w);
+	close(iev_main->ibuf.fd);
 
 	stop_spf_timer(rdeconf);
 	cand_list_clr();
@@ -221,9 +228,7 @@ rde_shutdown(void)
 	}
 	rde_nbr_free();
 
-	msgbuf_clear(&iev_ospfe->ibuf.w);
 	free(iev_ospfe);
-	msgbuf_clear(&iev_main->ibuf.w);
 	free(iev_main);
 	free(rdeconf);
 
@@ -261,7 +266,7 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 	u_int16_t		 l;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatal("imsg_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
@@ -278,7 +283,7 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 
 	for (;;) {
 		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("rde_dispatch_imsg: imsg_read error");
+			fatal("rde_dispatch_imsg: imsg_get error");
 		if (n == 0)
 			break;
 
@@ -356,7 +361,7 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 				}
 			}
 			if (l != 0)
-				log_warnx("rde_dispatch_imsg: peerid %lu, "
+				log_warnx("rde_dispatch_imsg: peerid %u, "
 				    "trailing garbage in Database Description "
 				    "packet", imsg.hdr.peerid);
 
@@ -387,7 +392,7 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 				    ntohs(v->lsa->hdr.len));
 			}
 			if (l != 0)
-				log_warnx("rde_dispatch_imsg: peerid %lu, "
+				log_warnx("rde_dispatch_imsg: peerid %u, "
 				    "trailing garbage in LS Request "
 				    "packet", imsg.hdr.peerid);
 			break;
@@ -624,7 +629,6 @@ rde_dispatch_parent(int fd, short event, void *bula)
 	struct iface_addr	*ia, *nia;
 	struct imsg		 imsg;
 	struct kroute		 kr;
-	struct rroute		 rr;
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct lsa		*lsa;
@@ -635,7 +639,7 @@ rde_dispatch_parent(int fd, short event, void *bula)
 	unsigned int		 ifindex;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatal("imsg_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
@@ -649,20 +653,20 @@ rde_dispatch_parent(int fd, short event, void *bula)
 
 	for (;;) {
 		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("rde_dispatch_parent: imsg_read error");
+			fatal("rde_dispatch_parent: imsg_get error");
 		if (n == 0)
 			break;
 
 		switch (imsg.hdr.type) {
 		case IMSG_NETWORK_ADD:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(rr)) {
+			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(kr)) {
 				log_warnx("rde_dispatch_parent: "
 				    "wrong imsg len");
 				break;
 			}
-			memcpy(&rr, imsg.data, sizeof(rr));
+			memcpy(&kr, imsg.data, sizeof(kr));
 
-			if ((lsa = rde_asext_get(&rr)) != NULL) {
+			if ((lsa = rde_asext_get(&kr)) != NULL) {
 				v = lsa_find(NULL, lsa->hdr.type,
 				    lsa->hdr.ls_id, lsa->hdr.adv_rtr);
 
@@ -670,14 +674,14 @@ rde_dispatch_parent(int fd, short event, void *bula)
 			}
 			break;
 		case IMSG_NETWORK_DEL:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(rr)) {
+			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(kr)) {
 				log_warnx("rde_dispatch_parent: "
 				    "wrong imsg len");
 				break;
 			}
-			memcpy(&rr, imsg.data, sizeof(rr));
+			memcpy(&kr, imsg.data, sizeof(kr));
 
-			if ((lsa = rde_asext_put(&rr)) != NULL) {
+			if ((lsa = rde_asext_put(&kr)) != NULL) {
 				v = lsa_find(NULL, lsa->hdr.type,
 				    lsa->hdr.ls_id, lsa->hdr.adv_rtr);
 
@@ -720,7 +724,7 @@ rde_dispatch_parent(int fd, short event, void *bula)
 			wasvalid = (iface->flags & IFF_UP) &&
 			    LINK_STATE_IS_UP(iface->linkstate);
 
-			if_update(iface, ifp->mtu, ifp->flags, ifp->media_type,
+			if_update(iface, ifp->mtu, ifp->flags, ifp->if_type,
 			    ifp->linkstate, ifp->baudrate);
 
 			/* Resend LSAs if interface state changes. */
@@ -1180,7 +1184,7 @@ rde_req_list_free(struct rde_nbr *nbr)
  * as-external LSA handling
  */
 struct lsa *
-rde_asext_get(struct rroute *rr)
+rde_asext_get(struct kroute *kr)
 {
 	struct area		*area;
 	struct iface		*iface;
@@ -1194,25 +1198,25 @@ rde_asext_get(struct rroute *rr)
 					continue;
 
 				inet6applymask(&addr, &ia->addr,
-				    rr->kr.prefixlen);
-				if (!memcmp(&addr, &rr->kr.prefix,
-				    sizeof(addr)) && rr->kr.prefixlen ==
+				    kr->prefixlen);
+				if (!memcmp(&addr, &kr->prefix,
+				    sizeof(addr)) && kr->prefixlen ==
 				    ia->prefixlen) {
 					/* already announced as Prefix LSA */
 					log_debug("rde_asext_get: %s/%d is "
 					    "part of prefix LSA",
-					    log_in6addr(&rr->kr.prefix),
-					    rr->kr.prefixlen);
+					    log_in6addr(&kr->prefix),
+					    kr->prefixlen);
 					return (NULL);
 				}
 			}
 
 	/* update of seqnum is done by lsa_merge */
-	return (orig_asext_lsa(rr, DEFAULT_AGE));
+	return (orig_asext_lsa(kr, DEFAULT_AGE));
 }
 
 struct lsa *
-rde_asext_put(struct rroute *rr)
+rde_asext_put(struct kroute *kr)
 {
 	/*
 	 * just try to remove the LSA. If the prefix is announced as
@@ -1220,7 +1224,7 @@ rde_asext_put(struct rroute *rr)
 	 */
 
 	/* remove by reflooding with MAX_AGE */
-	return (orig_asext_lsa(rr, MAX_AGE));
+	return (orig_asext_lsa(kr, MAX_AGE));
 }
 
 /*
@@ -1596,14 +1600,14 @@ comp_asext(struct lsa *a, struct lsa *b)
 }
 
 struct lsa *
-orig_asext_lsa(struct rroute *rr, u_int16_t age)
+orig_asext_lsa(struct kroute *kr, u_int16_t age)
 {
 	struct lsa	*lsa;
 	u_int32_t	 ext_tag;
 	u_int16_t	 len, ext_off;
 
 	len = sizeof(struct lsa_hdr) + sizeof(struct lsa_asext) +
-	    LSA_PREFIXSIZE(rr->kr.prefixlen);
+	    LSA_PREFIXSIZE(kr->prefixlen);
 
 	/*
 	 * nexthop -- on connected routes we are the nexthop,
@@ -1613,14 +1617,14 @@ orig_asext_lsa(struct rroute *rr, u_int16_t age)
 	 */
 
 	ext_off = len;
-	if (rr->kr.ext_tag) {
+	if (kr->ext_tag) {
 		len += sizeof(ext_tag);
 	}
 	if ((lsa = calloc(1, len)) == NULL)
 		fatal("orig_asext_lsa");
 
 	log_debug("orig_asext_lsa: %s/%d age %d",
-	    log_in6addr(&rr->kr.prefix), rr->kr.prefixlen, age);
+	    log_in6addr(&kr->prefix), kr->prefixlen, age);
 
 	/* LSA header */
 	lsa->hdr.age = htons(age);
@@ -1629,9 +1633,9 @@ orig_asext_lsa(struct rroute *rr, u_int16_t age)
 	lsa->hdr.seq_num = htonl(INIT_SEQ_NUM);
 	lsa->hdr.len = htons(len);
 
-	lsa->data.asext.prefix.prefixlen = rr->kr.prefixlen;
+	lsa->data.asext.prefix.prefixlen = kr->prefixlen;
 	memcpy((char *)lsa + sizeof(struct lsa_hdr) + sizeof(struct lsa_asext),
-	    &rr->kr.prefix, LSA_PREFIXSIZE(rr->kr.prefixlen));
+	    &kr->prefix, LSA_PREFIXSIZE(kr->prefixlen));
 
 	lsa->hdr.ls_id = lsa_find_lsid(&asext_tree, lsa->hdr.type,
 	    lsa->hdr.adv_rtr, comp_asext, lsa);
@@ -1645,22 +1649,22 @@ orig_asext_lsa(struct rroute *rr, u_int16_t age)
 		v = lsa_find(NULL, lsa->hdr.type, lsa->hdr.ls_id,
 		    lsa->hdr.adv_rtr);
 		if (v != NULL) {
-			rr->metric = ntohl(v->lsa->data.asext.metric);
-			if (rr->metric & LSA_ASEXT_T_FLAG) {
+			kr->metric = ntohl(v->lsa->data.asext.metric);
+			if (kr->metric & LSA_ASEXT_T_FLAG) {
 				memcpy(&ext_tag, (char *)v->lsa + ext_off,
 				    sizeof(ext_tag));
-				rr->kr.ext_tag = ntohl(ext_tag);
+				kr->ext_tag = ntohl(ext_tag);
 			}
-			rr->metric &= LSA_METRIC_MASK;
+			kr->metric &= LSA_METRIC_MASK;
 		}
 	}
 
-	if (rr->kr.ext_tag) {
-		lsa->data.asext.metric = htonl(rr->metric | LSA_ASEXT_T_FLAG);
-		ext_tag = htonl(rr->kr.ext_tag);
+	if (kr->ext_tag) {
+		lsa->data.asext.metric = htonl(kr->metric | LSA_ASEXT_T_FLAG);
+		ext_tag = htonl(kr->ext_tag);
 		memcpy((char *)lsa + ext_off, &ext_tag, sizeof(ext_tag));
 	} else {
-		lsa->data.asext.metric = htonl(rr->metric);
+		lsa->data.asext.metric = htonl(kr->metric);
 	}
 
 	lsa->hdr.ls_chksum = 0;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospf6d.h,v 1.28 2013/03/25 14:29:35 markus Exp $ */
+/*	$OpenBSD: ospf6d.h,v 1.31 2016/12/27 17:18:56 jca Exp $ */
 
 /*
  * Copyright (c) 2004, 2007 Esben Norby <norby@openbsd.org>
@@ -59,6 +59,12 @@
 #define	F_REJECT		0x0080
 #define	F_BLACKHOLE		0x0100
 #define	F_REDISTRIBUTED		0x0200
+
+static const char * const log_procnames[] = {
+	"parent",
+	"ospfe",
+	"rde"
+};
 
 struct imsgev {
 	struct imsgbuf		 ibuf;
@@ -316,7 +322,7 @@ struct iface {
 	u_int16_t		 dead_interval;
 	u_int16_t		 metric;
 	enum iface_type		 type;
-	u_int8_t		 media_type;
+	u_int8_t		 if_type;
 	u_int8_t		 linkstate;
 	u_int8_t		 priority;
 	u_int8_t		 cflags;
@@ -384,16 +390,12 @@ struct kroute {
 	struct in6_addr	prefix;
 	struct in6_addr	nexthop;
 	u_int32_t	ext_tag;
+	u_int32_t	metric;
 	unsigned int	scope;		/* scope of nexthop */
 	u_int16_t	flags;
 	u_int16_t	rtlabel;
 	u_short		ifindex;
 	u_int8_t	prefixlen;
-};
-
-struct rroute {
-	struct kroute	kr;
-	u_int32_t	metric;
 };
 
 /* name2id */
@@ -435,7 +437,7 @@ struct ctl_iface {
 	u_int16_t		 rxmt_interval;
 	enum iface_type		 type;
 	u_int8_t		 linkstate;
-	u_int8_t		 mediatype;
+	u_int8_t		 if_type;
 	u_int8_t		 priority;
 	u_int8_t		 passive;
 };
@@ -549,7 +551,11 @@ void		inet6applymask(struct in6_addr *, const struct in6_addr *, int);
 
 int		fetchifs(u_short);
 
-/* log.h */
+/* logmsg.h */
+const char	*log_in6addr(const struct in6_addr *);
+const char	*log_in6addr_scope(const struct in6_addr *, unsigned int);
+const char	*log_rtr_id(u_int32_t);
+const char	*log_sockaddr(void *);
 const char	*nbr_state_name(int);
 const char	*if_state_name(int);
 const char	*if_type_name(enum iface_type);

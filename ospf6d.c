@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospf6d.c,v 1.26 2015/01/16 06:40:19 deraadt Exp $ */
+/*	$OpenBSD: ospf6d.c,v 1.32 2016/09/03 10:25:36 renato Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -48,8 +48,7 @@
 
 void		main_sig_handler(int, short, void *);
 __dead void	usage(void);
-void		ospfd_shutdown(void);
-int		check_child(pid_t, const char *);
+__dead void	ospfd_shutdown(void);
 
 void	main_dispatch_ospfe(int, short, void *);
 void	main_dispatch_rde(int, short, void *);
@@ -75,29 +74,12 @@ pid_t			 rde_pid = 0;
 void
 main_sig_handler(int sig, short event, void *arg)
 {
-	/*
-	 * signal handler rules don't apply, libevent decouples for us
-	 */
-
-	int	die = 0;
-
+	/* signal handler rules don't apply, libevent decouples for us */
 	switch (sig) {
 	case SIGTERM:
 	case SIGINT:
-		die = 1;
-		/* FALLTHROUGH */
-	case SIGCHLD:
-		if (check_child(ospfe_pid, "ospf engine")) {
-			ospfe_pid = 0;
-			die = 1;
-		}
-		if (check_child(rde_pid, "route decision engine")) {
-			rde_pid = 0;
-			die = 1;
-		}
-		if (die)
-			ospfd_shutdown();
-		break;
+		ospfd_shutdown();
+		/* NOTREACHED */
 	case SIGHUP:
 		if (ospf_reload() == -1)
 			log_warnx("configuration reload failed");
@@ -124,7 +106,7 @@ usage(void)
 int
 main(int argc, char *argv[])
 {
-	struct event		 ev_sigint, ev_sigterm, ev_sigchld, ev_sighup;
+	struct event		 ev_sigint, ev_sigterm, ev_sighup;
 	int			 ch, opts = 0;
 	int			 debug = 0;
 	int			 ipforwarding;
@@ -134,6 +116,7 @@ main(int argc, char *argv[])
 
 	conffile = CONF_FILE;
 	ospfd_process = PROC_MAIN;
+	log_procname = log_procnames[ospfd_process];
 	sockname = OSPF6D_SOCKET;
 
 	log_init(1);	/* log to stderr until daemonized */
@@ -224,19 +207,15 @@ main(int argc, char *argv[])
 
 	log_info("startup");
 
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC,
-	    pipe_parent2ospfe) == -1)
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    PF_UNSPEC, pipe_parent2ospfe) == -1)
 		fatal("socketpair");
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pipe_parent2rde) == -1)
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    PF_UNSPEC, pipe_parent2rde) == -1)
 		fatal("socketpair");
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pipe_ospfe2rde) == -1)
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+	    PF_UNSPEC, pipe_ospfe2rde) == -1)
 		fatal("socketpair");
-	session_socket_blockmode(pipe_parent2ospfe[0], BM_NONBLOCK);
-	session_socket_blockmode(pipe_parent2ospfe[1], BM_NONBLOCK);
-	session_socket_blockmode(pipe_parent2rde[0], BM_NONBLOCK);
-	session_socket_blockmode(pipe_parent2rde[1], BM_NONBLOCK);
-	session_socket_blockmode(pipe_ospfe2rde[0], BM_NONBLOCK);
-	session_socket_blockmode(pipe_ospfe2rde[1], BM_NONBLOCK);
 
 	/* start children */
 	rde_pid = rde(ospfd_conf, pipe_parent2rde, pipe_ospfe2rde,
@@ -244,19 +223,14 @@ main(int argc, char *argv[])
 	ospfe_pid = ospfe(ospfd_conf, pipe_parent2ospfe, pipe_ospfe2rde,
 	    pipe_parent2rde);
 
-	/* show who we are */
-	setproctitle("parent");
-
 	event_init();
 
 	/* setup signal handler */
 	signal_set(&ev_sigint, SIGINT, main_sig_handler, NULL);
 	signal_set(&ev_sigterm, SIGTERM, main_sig_handler, NULL);
-	signal_set(&ev_sigchld, SIGCHLD, main_sig_handler, NULL);
 	signal_set(&ev_sighup, SIGHUP, main_sig_handler, NULL);
 	signal_add(&ev_sigint, NULL);
 	signal_add(&ev_sigterm, NULL);
-	signal_add(&ev_sigchld, NULL);
 	signal_add(&ev_sighup, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
@@ -295,55 +269,40 @@ main(int argc, char *argv[])
 	return (0);
 }
 
-void
+__dead void
 ospfd_shutdown(void)
 {
 	pid_t	pid;
+	int	status;
 
-	if (ospfe_pid)
-		kill(ospfe_pid, SIGTERM);
-
-	if (rde_pid)
-		kill(rde_pid, SIGTERM);
+	/* close pipes */
+	msgbuf_clear(&iev_ospfe->ibuf.w);
+	close(iev_ospfe->ibuf.fd);
+	msgbuf_clear(&iev_rde->ibuf.w);
+	close(iev_rde->ibuf.fd);
 
 	control_cleanup(ospfd_conf->csock);
 	kr_shutdown();
 	carp_demote_shutdown();
 
+	log_debug("waiting for children to terminate");
 	do {
-		if ((pid = wait(NULL)) == -1 &&
-		    errno != EINTR && errno != ECHILD)
-			fatal("wait");
+		pid = wait(&status);
+		if (pid == -1) {
+			if (errno != EINTR && errno != ECHILD)
+				fatal("wait");
+		} else if (WIFSIGNALED(status))
+			log_warnx("%s terminated; signal %d",
+			    (pid == rde_pid) ? "route decision engine" :
+			    "ospf engine", WTERMSIG(status));
 	} while (pid != -1 || (pid == -1 && errno == EINTR));
 
-	msgbuf_clear(&iev_ospfe->ibuf.w);
 	free(iev_ospfe);
-	msgbuf_clear(&iev_rde->ibuf.w);
 	free(iev_rde);
 	free(ospfd_conf);
 
 	log_info("terminating");
 	exit(0);
-}
-
-int
-check_child(pid_t pid, const char *pname)
-{
-	int	status;
-
-	if (waitpid(pid, &status, WNOHANG) > 0) {
-		if (WIFEXITED(status)) {
-			log_warnx("lost child: %s exited", pname);
-			return (1);
-		}
-		if (WIFSIGNALED(status)) {
-			log_warnx("lost child: %s terminated; signal %d",
-			    pname, WTERMSIG(status));
-			return (1);
-		}
-	}
-
-	return (0);
 }
 
 /* imsg handling */
@@ -359,7 +318,7 @@ main_dispatch_ospfe(int fd, short event, void *bula)
 	int			 shut = 0, verbose;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatal("imsg_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
@@ -433,7 +392,7 @@ main_dispatch_rde(int fd, short event, void *bula)
 	int		 shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatal("imsg_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
@@ -782,7 +741,7 @@ merge_interfaces(struct area *a, struct area *xa)
 		i->priority = xi->priority;
 		i->flags = xi->flags; /* needed? */
 		i->type = xi->type; /* needed? */
-		i->media_type = xi->media_type; /* needed? */
+		i->if_type = xi->if_type; /* needed? */
 		i->linkstate = xi->linkstate; /* needed? */
 
 #if 0 /* XXX needs some kind of love */

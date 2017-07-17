@@ -1,4 +1,4 @@
-/*	$OpenBSD: kroute.c,v 1.45 2015/01/16 06:40:19 deraadt Exp $ */
+/*	$OpenBSD: kroute.c,v 1.50 2016/12/27 17:18:56 jca Exp $ */
 
 /*
  * Copyright (c) 2004 Esben Norby <norby@openbsd.org>
@@ -51,12 +51,12 @@ struct {
 
 struct kroute_node {
 	RB_ENTRY(kroute_node)	 entry;
-	struct kroute		 r;
 	struct kroute_node	*next;
+	struct kroute		 r;
 };
 
 void	kr_redist_remove(struct kroute_node *, struct kroute_node *);
-int	kr_redist_eval(struct kroute *, struct rroute *);
+int	kr_redist_eval(struct kroute *, struct kroute *);
 void	kr_redistribute(struct kroute_node *);
 int	kroute_compare(struct kroute_node *, struct kroute_node *);
 
@@ -98,7 +98,8 @@ kr_init(int fs)
 
 	kr_state.fib_sync = fs;
 
-	if ((kr_state.fd = socket(AF_ROUTE, SOCK_RAW, 0)) == -1) {
+	if ((kr_state.fd = socket(AF_ROUTE,
+	    SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)) == -1) {
 		log_warn("kr_init: socket");
 		return (-1);
 	}
@@ -343,7 +344,7 @@ kr_show_route(struct imsg *imsg)
 void
 kr_redist_remove(struct kroute_node *kh, struct kroute_node *kn)
 {
-	struct rroute	 rr;
+	struct kroute	 *kr;
 
 	/* was the route redistributed? */
 	if ((kn->r.flags & F_REDISTRIBUTED) == 0)
@@ -351,8 +352,7 @@ kr_redist_remove(struct kroute_node *kh, struct kroute_node *kn)
 
 	/* remove redistributed flag */
 	kn->r.flags &= ~F_REDISTRIBUTED;
-	rr.kr = kn->r;
-	rr.metric = DEFAULT_REDIST_METRIC;	/* some dummy value */
+	kr = &kn->r;
 
 	/* probably inform the RDE (check if no other path is redistributed) */
 	for (kn = kh; kn; kn = kn->next)
@@ -360,12 +360,12 @@ kr_redist_remove(struct kroute_node *kh, struct kroute_node *kn)
 			break;
 
 	if (kn == NULL)
-		main_imsg_compose_rde(IMSG_NETWORK_DEL, 0, &rr,
-		    sizeof(struct rroute));
+		main_imsg_compose_rde(IMSG_NETWORK_DEL, 0, kr,
+		    sizeof(struct kroute));
 }
 
 int
-kr_redist_eval(struct kroute *kr, struct rroute *rr)
+kr_redist_eval(struct kroute *kr, struct kroute *new_kr)
 {
 	u_int32_t	 metric = 0;
 
@@ -410,9 +410,9 @@ kr_redist_eval(struct kroute *kr, struct rroute *rr)
 	 * only one of all multipath routes can be redistributed so
 	 * redistribute the best one.
 	 */
-	if (rr->metric > metric) {
-		rr->kr = *kr;
-		rr->metric = metric;
+	if (new_kr->metric > metric) {
+		*new_kr = *kr;
+		new_kr->metric = metric;
 	}
 
 	return (1);
@@ -430,26 +430,25 @@ void
 kr_redistribute(struct kroute_node *kh)
 {
 	struct kroute_node	*kn;
-	struct rroute		 rr;
+	struct kroute		 kr;
 	int			 redistribute = 0;
 
-	bzero(&rr, sizeof(rr));
-	rr.metric = UINT_MAX;
+	bzero(&kr, sizeof(kr));
+	kr.metric = UINT_MAX;
 	for (kn = kh; kn; kn = kn->next)
-		if (kr_redist_eval(&kn->r, &rr))
+		if (kr_redist_eval(&kn->r, &kr))
 			redistribute = 1;
 
 	if (!redistribute)
 		return;
 
-	if (rr.kr.flags & F_REDISTRIBUTED) {
-		main_imsg_compose_rde(IMSG_NETWORK_ADD, 0, &rr,
-		    sizeof(struct rroute));
+	if (kr.flags & F_REDISTRIBUTED) {
+		main_imsg_compose_rde(IMSG_NETWORK_ADD, 0, &kr,
+		    sizeof(struct kroute));
 	} else {
-		rr.metric = DEFAULT_REDIST_METRIC;	/* some dummy value */
-		rr.kr = kh->r;
-		main_imsg_compose_rde(IMSG_NETWORK_DEL, 0, &rr,
-		    sizeof(struct rroute));
+		kr = kh->r;
+		main_imsg_compose_rde(IMSG_NETWORK_DEL, 0, &kr,
+		    sizeof(struct kroute));
 	}
 }
 
@@ -728,12 +727,6 @@ if_change(u_short ifindex, int flags, struct if_data *ifd)
 		return;
 	}
 
-	isvalid = (iface->flags & IFF_UP) &&
-	    LINK_STATE_IS_UP(iface->linkstate);
-
-	if (wasvalid == isvalid)
-		return;		/* nothing changed wrt validity */
-
 	/* inform engine and rde about state change if interface is used */
 	if (iface->cflags & F_IFACE_CONFIGURED) {
 		main_imsg_compose_ospfe(IMSG_IFINFO, 0, iface,
@@ -741,6 +734,12 @@ if_change(u_short ifindex, int flags, struct if_data *ifd)
 		main_imsg_compose_rde(IMSG_IFINFO, 0, iface,
 		    sizeof(struct iface));
 	}
+
+	isvalid = (iface->flags & IFF_UP) &&
+	    LINK_STATE_IS_UP(iface->linkstate);
+
+	if (wasvalid == isvalid)
+		return;		/* nothing changed wrt validity */
 
 	/* update redistribute list */
 	RB_FOREACH(kr, kroute_tree, &krt) {
@@ -1091,7 +1090,8 @@ fetchtable(void)
 		if ((sa = rti_info[RTAX_DST]) == NULL)
 			continue;
 
-		if (rtm->rtm_flags & RTF_LLINFO)	/* arp cache */
+		/* Skip ARP/ND cache and broadcast routes. */
+		if (rtm->rtm_flags & (RTF_LLINFO|RTF_BROADCAST))
 			continue;
 
 		if ((kr = calloc(1, sizeof(struct kroute_node))) == NULL) {
@@ -1136,6 +1136,11 @@ fetchtable(void)
 		if ((sa = rti_info[RTAX_GATEWAY]) != NULL)
 			switch (sa->sa_family) {
 			case AF_INET6:
+				if (rtm->rtm_flags & RTF_CONNECTED) {
+					kr->r.flags |= F_CONNECTED;
+					break;
+				}
+
 				sa_in6 = (struct sockaddr_in6 *)sa;
 				/*
 				 * XXX The kernel provides the scope via the
@@ -1146,6 +1151,10 @@ fetchtable(void)
 				kr->r.scope = sa_in6->sin6_scope_id;
 				break;
 			case AF_LINK:
+				/*
+				 * Traditional BSD connected routes have
+				 * a gateway of type AF_LINK.
+				 */
 				kr->r.flags |= F_CONNECTED;
 				break;
 			}
@@ -1256,6 +1265,8 @@ dispatch_rtmsg(void)
 	u_short			 ifindex = 0;
 
 	if ((n = read(kr_state.fd, &buf, sizeof(buf))) == -1) {
+		if (errno == EAGAIN || errno == EINTR)
+			return (0);
 		log_warn("dispatch_rtmsg: read error");
 		return (-1);
 	}
@@ -1268,6 +1279,9 @@ dispatch_rtmsg(void)
 	lim = buf + n;
 	for (next = buf; next < lim; next += rtm->rtm_msglen) {
 		rtm = (struct rt_msghdr *)next;
+		if (lim < next + sizeof(u_short) ||
+		    lim < next + rtm->rtm_msglen)
+			fatalx("dispatch_rtmsg: partial rtm in buffer");
 		if (rtm->rtm_version != RTM_VERSION)
 			continue;
 
@@ -1292,7 +1306,8 @@ dispatch_rtmsg(void)
 			if (rtm->rtm_errno)		/* failed attempts... */
 				continue;
 
-			if (rtm->rtm_flags & RTF_LLINFO)	/* arp cache */
+			/* Skip ARP/ND cache and broadcast routes. */
+			if (rtm->rtm_flags & (RTF_LLINFO|RTF_BROADCAST))
 				continue;
 
 #ifdef RTF_MPATH
