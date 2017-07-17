@@ -69,6 +69,10 @@
 #define MIN_SPF_HOLDTIME	1
 #define MAX_SPF_HOLDTIME	5
 
+/* msec */
+#define KR_RELOAD_TIMER		250
+#define KR_RELOAD_HOLD_TIMER	5000
+
 #define MIN_MD_ID		0
 #define MAX_MD_ID		255
 

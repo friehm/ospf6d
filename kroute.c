@@ -45,14 +45,21 @@ struct {
 	u_int32_t		rtseq;
 	pid_t			pid;
 	int			fib_sync;
+	int			fib_serial;
 	int			fd;
 	struct event		ev;
+	struct event		reload;
+#define KR_RELOAD_IDLE	0
+#define KR_RELOAD_FETCH	1
+#define KR_RELOAD_HOLD	2
+	int			reload_state;
 } kr_state;
 
 struct kroute_node {
 	RB_ENTRY(kroute_node)	 entry;
 	struct kroute_node	*next;
 	struct kroute		 r;
+	int			 serial;
 };
 
 void	kr_redist_remove(struct kroute_node *, struct kroute_node *);
@@ -88,6 +95,9 @@ void		if_announce(void *);
 int		send_rtmsg(int, int, struct kroute *);
 int		dispatch_rtmsg(void);
 int		fetchtable(void);
+int		rtmsg_process(char *, size_t);
+void		kr_fib_reload_timer(int, short, void *);
+void		kr_fib_reload_arm_timer(int);
 
 RB_HEAD(kroute_tree, kroute_node)	krt;
 RB_PROTOTYPE(kroute_tree, kroute_node, entry, kroute_compare)
@@ -102,7 +112,7 @@ kr_init(int fs)
 	kr_state.fib_sync = fs;
 
 	if ((kr_state.fd = socket(AF_ROUTE,
-	    SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)) == -1) {
+	    SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, AF_INET6)) == -1) {
 		log_warn("kr_init: socket");
 		return (-1);
 	}
@@ -139,6 +149,9 @@ kr_init(int fs)
 	event_set(&kr_state.ev, kr_state.fd, EV_READ | EV_PERSIST,
 	    kr_dispatch_msg, NULL);
 	event_add(&kr_state.ev, NULL);
+
+	kr_state.reload_state = KR_RELOAD_IDLE;
+	evtimer_set(&kr_state.reload, kr_fib_reload_timer, NULL);
 
 	return (0);
 }
@@ -329,12 +342,70 @@ kr_fib_decouple(void)
 	log_info("kernel routing table decoupled");
 }
 
+void
+kr_fib_reload_timer(int fd, short event, void *bula)
+{
+	if (kr_state.reload_state == KR_RELOAD_FETCH) {
+		kr_fib_reload();
+		kr_state.reload_state = KR_RELOAD_HOLD;
+		kr_fib_reload_arm_timer(KR_RELOAD_HOLD_TIMER);
+	} else {
+		kr_state.reload_state = KR_RELOAD_IDLE;
+	}
+}
+
+void
+kr_fib_reload_arm_timer(int delay)
+{
+	struct timeval		 tv;
+
+	timerclear(&tv);
+	tv.tv_sec = delay / 1000;
+	tv.tv_usec = (delay % 1000) * 1000;
+
+	if (evtimer_add(&kr_state.reload, &tv) == -1)
+		fatal("add_reload_timer");
+}
+
+void
+kr_fib_reload()
+{
+	struct kroute_node	*krn, *kr, *kn;
+
+	log_info("reloading interface list and routing table");
+
+	kr_state.fib_serial++;
+
+	if (fetchifs(0) == -1 || fetchtable() == -1)
+		return;
+
+	for (kr = RB_MIN(kroute_tree, &krt); kr != NULL; kr = krn) {
+		krn = RB_NEXT(kroute_tree, &krt, kr);
+
+		do {
+			kn = kr->next;
+
+			if (kr->serial != kr_state.fib_serial) {
+				if (kr->r.priority == RTP_OSPF) {
+					kr->serial = kr_state.fib_serial;
+					if (send_rtmsg(kr_state.fd,
+					    RTM_ADD, &kr->r) != 0)
+						break;
+				} else
+					kroute_remove(kr);
+			}
+
+		} while ((kr = kn) != NULL);
+	}
+}
+
 /* ARGSUSED */
 void
 kr_dispatch_msg(int fd, short event, void *bula)
 {
 	/* XXX this is stupid */
-	dispatch_rtmsg();
+	if (dispatch_rtmsg() == -1)
+		event_loopexit(NULL);
 }
 
 void
@@ -592,6 +663,8 @@ int
 kroute_insert(struct kroute_node *kr)
 {
 	struct kroute_node	*krm, *krh;
+
+	kr->serial = kr_state.fib_serial;
 
 	if ((krh = RB_INSERT(kroute_tree, &krt, kr)) != NULL) {
 		/*
@@ -1116,12 +1189,8 @@ fetchtable(void)
 {
 	size_t			 len;
 	int			 mib[7];
-	char			*buf, *next, *lim;
-	struct rt_msghdr	*rtm;
-	struct sockaddr		*sa, *rti_info[RTAX_MAX];
-	struct sockaddr_in6	*sa_in6;
-	struct sockaddr_rtlabel	*label;
-	struct kroute_node	*kr;
+	char			*buf;
+	int			 rv;
 
 	mib[0] = CTL_NET;
 	mib[1] = PF_ROUTE;
@@ -1145,102 +1214,10 @@ fetchtable(void)
 		return (-1);
 	}
 
-	lim = buf + len;
-	for (next = buf; next < lim; next += rtm->rtm_msglen) {
-		rtm = (struct rt_msghdr *)next;
-		if (rtm->rtm_version != RTM_VERSION)
-			continue;
-		sa = (struct sockaddr *)(next + rtm->rtm_hdrlen);
-		get_rtaddrs(rtm->rtm_addrs, sa, rti_info);
-
-		if ((sa = rti_info[RTAX_DST]) == NULL)
-			continue;
-
-		/* Skip ARP/ND cache and broadcast routes. */
-		if (rtm->rtm_flags & (RTF_LLINFO|RTF_BROADCAST))
-			continue;
-
-		if ((kr = calloc(1, sizeof(struct kroute_node))) == NULL) {
-			log_warn("fetchtable");
-			free(buf);
-			return (-1);
-		}
-
-		kr->r.flags = F_KERNEL;
-		kr->r.priority = rtm->rtm_priority;
-
-		switch (sa->sa_family) {
-		case AF_INET6:
-			kr->r.prefix =
-			    ((struct sockaddr_in6 *)sa)->sin6_addr;
-			sa_in6 = (struct sockaddr_in6 *)rti_info[RTAX_NETMASK];
-			if (rtm->rtm_flags & RTF_STATIC)
-				kr->r.flags |= F_STATIC;
-			if (rtm->rtm_flags & RTF_BLACKHOLE)
-				kr->r.flags |= F_BLACKHOLE;
-			if (rtm->rtm_flags & RTF_REJECT)
-				kr->r.flags |= F_REJECT;
-			if (rtm->rtm_flags & RTF_DYNAMIC)
-				kr->r.flags |= F_DYNAMIC;
-			if (sa_in6 != NULL) {
-				if (sa_in6->sin6_len == 0)
-					break;
-				kr->r.prefixlen =
-				    mask2prefixlen(sa_in6);
-			} else if (rtm->rtm_flags & RTF_HOST)
-				kr->r.prefixlen = 128;
-			else
-				fatalx("classful IPv6 route?!!");
-			break;
-		default:
-			free(kr);
-			continue;
-		}
-
-		kr->r.ifindex = rtm->rtm_index;
-		if ((sa = rti_info[RTAX_GATEWAY]) != NULL)
-			switch (sa->sa_family) {
-			case AF_INET6:
-				if (rtm->rtm_flags & RTF_CONNECTED) {
-					kr->r.flags |= F_CONNECTED;
-					break;
-				}
-
-				sa_in6 = (struct sockaddr_in6 *)sa;
-				/*
-				 * XXX The kernel provides the scope via the
-				 * XXX kame hack instead of the scope_id field.
-				 */
-				recoverscope(sa_in6);
-				kr->r.nexthop = sa_in6->sin6_addr;
-				kr->r.scope = sa_in6->sin6_scope_id;
-				break;
-			case AF_LINK:
-				/*
-				 * Traditional BSD connected routes have
-				 * a gateway of type AF_LINK.
-				 */
-				kr->r.flags |= F_CONNECTED;
-				break;
-			}
-
-		if (rtm->rtm_priority == RTP_OSPF)  {
-			send_rtmsg(kr_state.fd, RTM_DELETE, &kr->r);
-			free(kr);
-		} else {
-			if ((label = (struct sockaddr_rtlabel *)
-			    rti_info[RTAX_LABEL]) != NULL) {
-				kr->r.rtlabel =
-				    rtlabel_name2id(label->sr_label);
-				kr->r.ext_tag =
-				    rtlabel_id2tag(kr->r.rtlabel);
-			}
-			kroute_insert(kr);
-		}
-
-	}
+	rv = rtmsg_process(buf, len);
 	free(buf);
-	return (0);
+
+	return (rv);
 }
 
 int
@@ -1248,12 +1225,8 @@ fetchifs(u_short ifindex)
 {
 	size_t			 len;
 	int			 mib[6];
-	char			*buf, *next, *lim;
-	struct rt_msghdr	*rtm;
-	struct if_msghdr	 ifm;
-	struct ifa_msghdr	*ifam;
-	struct iface		*iface;
-	struct sockaddr		*sa, *rti_info[RTAX_MAX];
+	char			*buf;
+	int			 rv;
 
 	mib[0] = CTL_NET;
 	mib[1] = PF_ROUTE;
@@ -1267,7 +1240,7 @@ fetchifs(u_short ifindex)
 		return (-1);
 	}
 	if ((buf = malloc(len)) == NULL) {
-		log_warn("fetchifs");
+		log_warn("fetchif");
 		return (-1);
 	}
 	if (sysctl(mib, 6, buf, &len, NULL, 0) == -1) {
@@ -1276,38 +1249,10 @@ fetchifs(u_short ifindex)
 		return (-1);
 	}
 
-	lim = buf + len;
-	for (next = buf; next < lim; next += rtm->rtm_msglen) {
-		rtm = (struct rt_msghdr *)next;
-		if (rtm->rtm_version != RTM_VERSION)
-			continue;
-		switch (rtm->rtm_type) {
-		case RTM_IFINFO:
-			bcopy(rtm, &ifm, sizeof ifm);
-			sa = (struct sockaddr *)(next + sizeof(ifm));
-			get_rtaddrs(ifm.ifm_addrs, sa, rti_info);
-
-			if ((iface = kif_update(ifm.ifm_index,
-			    ifm.ifm_flags, &ifm.ifm_data,
-			    (struct sockaddr_dl *)rti_info[RTAX_IFP])) == NULL)
-			break;
-		case RTM_NEWADDR:
-			ifam = (struct ifa_msghdr *)rtm;
-			if ((ifam->ifam_addrs & (RTA_NETMASK | RTA_IFA |
-			    RTA_BRD)) == 0)
-				break;
-			sa = (struct sockaddr *)(ifam + 1);
-			get_rtaddrs(ifam->ifam_addrs, sa, rti_info);
-
-			if_newaddr(ifam->ifam_index,
-			    (struct sockaddr_in6 *)rti_info[RTAX_IFA],
-			    (struct sockaddr_in6 *)rti_info[RTAX_NETMASK],
-			    (struct sockaddr_in6 *)rti_info[RTAX_BRD]);
-			break;
-		}
-	}
+	rv = rtmsg_process(buf, len);
 	free(buf);
-	return (0);
+
+	return (rv);
 }
 
 int
@@ -1315,19 +1260,6 @@ dispatch_rtmsg(void)
 {
 	char			 buf[RT_BUF_SIZE];
 	ssize_t			 n;
-	char			*next, *lim;
-	struct rt_msghdr	*rtm;
-	struct if_msghdr	 ifm;
-	struct ifa_msghdr	*ifam;
-	struct sockaddr		*sa, *rti_info[RTAX_MAX];
-	struct sockaddr_in6	*sa_in6;
-	struct sockaddr_rtlabel	*label;
-	struct kroute_node	*kr, *okr;
-	struct in6_addr		 prefix, nexthop;
-	u_int8_t		 prefixlen, prio;
-	int			 flags, mpath;
-	unsigned int		 scope;
-	u_short			 ifindex = 0;
 
 	if ((n = read(kr_state.fd, &buf, sizeof(buf))) == -1) {
 		if (errno == EAGAIN || errno == EINTR)
@@ -1341,12 +1273,35 @@ dispatch_rtmsg(void)
 		return (-1);
 	}
 
-	lim = buf + n;
-	for (next = buf; next < lim; next += rtm->rtm_msglen) {
+	return (rtmsg_process(buf, n));
+}
+
+int
+rtmsg_process(char *buf, size_t len)
+{
+	struct rt_msghdr	*rtm;
+	struct if_msghdr	 ifm;
+	struct ifa_msghdr	*ifam;
+	struct sockaddr		*sa, *rti_info[RTAX_MAX];
+	struct sockaddr_in6	*sa_in6;
+	struct sockaddr_rtlabel	*label;
+	struct kroute_node	*kr, *okr;
+	struct in6_addr		 prefix, nexthop;
+	u_int8_t		 prefixlen, prio;
+	int			 flags, mpath;
+	u_short			 ifindex = 0;
+	int			 rv, delay;
+	unsigned int		 scope;
+
+	size_t			 offset;
+	char			*next;
+
+	for (offset = 0; offset < len; offset += rtm->rtm_msglen) {
+		next = buf + offset;
 		rtm = (struct rt_msghdr *)next;
-		if (lim < next + sizeof(u_short) ||
-		    lim < next + rtm->rtm_msglen)
-			fatalx("dispatch_rtmsg: partial rtm in buffer");
+		if (len < offset + sizeof(u_short) ||
+		    len < offset + rtm->rtm_msglen)
+			fatalx("rtmsg_process: partial rtm in buffer");
 		if (rtm->rtm_version != RTM_VERSION)
 			continue;
 
@@ -1358,18 +1313,25 @@ dispatch_rtmsg(void)
 		mpath = 0;
 		prio = 0;
 
-		if (rtm->rtm_type == RTM_ADD || rtm->rtm_type == RTM_CHANGE ||
-		    rtm->rtm_type == RTM_DELETE) {
-			sa = (struct sockaddr *)(next + rtm->rtm_hdrlen);
-			get_rtaddrs(rtm->rtm_addrs, sa, rti_info);
+		sa = (struct sockaddr *)(next + rtm->rtm_hdrlen);
+		get_rtaddrs(rtm->rtm_addrs, sa, rti_info);
+
+		switch (rtm->rtm_type) {
+		case RTM_ADD:
+		case RTM_GET:
+		case RTM_CHANGE:
+		case RTM_DELETE:
+			if (rtm->rtm_errno)		/* failed attempts... */
+				continue;
 
 			if (rtm->rtm_tableid != 0)
 				continue;
 
-			if (rtm->rtm_pid == kr_state.pid) /* caused by us */
+			if (rtm->rtm_type == RTM_GET &&
+			    rtm->rtm_pid != kr_state.pid)
 				continue;
 
-			if (rtm->rtm_errno)		/* failed attempts... */
+			if ((sa = rti_info[RTAX_DST]) == NULL)
 				continue;
 
 			/* Skip ARP/ND cache and broadcast routes. */
@@ -1379,6 +1341,8 @@ dispatch_rtmsg(void)
 			if (rtm->rtm_flags & RTF_MPATH)
 				mpath = 1;
 			prio = rtm->rtm_priority;
+			flags = (prio == RTP_OSPF) ?
+			    F_OSPFD_INSERTED : F_KERNEL;
 
 			switch (sa->sa_family) {
 			case AF_INET6:
@@ -1411,6 +1375,11 @@ dispatch_rtmsg(void)
 			if ((sa = rti_info[RTAX_GATEWAY]) != NULL) {
 				switch (sa->sa_family) {
 				case AF_INET6:
+					if (rtm->rtm_flags & RTF_CONNECTED) {
+						flags |= F_CONNECTED;
+						break;
+					}
+
 					sa_in6 = (struct sockaddr_in6 *)sa;
 					/*
 					 * XXX The kernel provides the scope
@@ -1422,6 +1391,10 @@ dispatch_rtmsg(void)
 					scope = sa_in6->sin6_scope_id;
 					break;
 				case AF_LINK:
+					/*
+					 * Traditional BSD connected routes have
+					 * a gateway of type AF_LINK.
+					 */
 					flags |= F_CONNECTED;
 					break;
 				}
@@ -1430,6 +1403,7 @@ dispatch_rtmsg(void)
 
 		switch (rtm->rtm_type) {
 		case RTM_ADD:
+		case RTM_GET:
 		case RTM_CHANGE:
 			if (IN6_IS_ADDR_UNSPECIFIED(&nexthop) &&
 			    !(flags & F_CONNECTED)) {
@@ -1440,15 +1414,13 @@ dispatch_rtmsg(void)
 
 			if ((okr = kroute_find(&prefix, prefixlen, prio))
 			    != NULL) {
-				/* just add new multipath routes */
-				if (mpath && rtm->rtm_type == RTM_ADD)
-					goto add;
 				/* get the correct route */
 				kr = okr;
-				if (mpath && (kr = kroute_matchgw(okr,
-				    &nexthop, scope)) == NULL) {
-					log_warnx("dispatch_rtmsg mpath route"
-					    " not found");
+				if ((mpath || prio == RTP_OSPF) &&
+				    (kr = kroute_matchgw(okr, &nexthop,
+				    scope)) == NULL) {
+					log_warnx("dispatch_rtmsg "
+					    "mpath route not found");
 					/* add routes we missed out earlier */
 					goto add;
 				}
@@ -1477,14 +1449,16 @@ dispatch_rtmsg(void)
 					kr->r.flags |= F_DOWN;
 
 				/* just readd, the RDE will care */
+				kr->serial = kr_state.fib_serial;
 				kr_redistribute(okr);
 			} else {
 add:
 				if ((kr = calloc(1,
 				    sizeof(struct kroute_node))) == NULL) {
-					log_warn("dispatch_rtmsg");
+					log_warn("dispatch calloc");
 					return (-1);
 				}
+
 				kr->r.prefix = prefix;
 				kr->r.prefixlen = prefixlen;
 				kr->r.nexthop = nexthop;
@@ -1493,15 +1467,27 @@ add:
 				kr->r.ifindex = ifindex;
 				kr->r.priority = prio;
 
-				if ((label = (struct sockaddr_rtlabel *)
-				    rti_info[RTAX_LABEL]) != NULL) {
-					kr->r.rtlabel =
-					    rtlabel_name2id(label->sr_label);
-					kr->r.ext_tag =
-					    rtlabel_id2tag(kr->r.rtlabel);
-				}
+				if (rtm->rtm_priority == RTP_OSPF) {
+					log_warnx("alien OSPF route %s/%d",
+					    log_in6addr(&prefix), prefixlen);
+					rv = send_rtmsg(kr_state.fd,
+					    RTM_DELETE, &kr->r);
+					free(kr);
+					if (rv == -1)
+						return (-1);
+				} else {
+					if ((label = (struct sockaddr_rtlabel *)
+					    rti_info[RTAX_LABEL]) != NULL) {
+						kr->r.rtlabel =
+						    rtlabel_name2id(
+						    label->sr_label);
+						kr->r.ext_tag =
+						    rtlabel_id2tag(
+						    kr->r.rtlabel);
+					}
 
-				kroute_insert(kr);
+					kroute_insert(kr);
+				}
 			}
 			break;
 		case RTM_DELETE:
@@ -1514,8 +1500,8 @@ add:
 			okr = kr;
 			if (mpath && (kr = kroute_matchgw(kr, &nexthop,
 			    scope)) == NULL) {
-				log_warnx("dispatch_rtmsg mpath route"
-				    " not found");
+				log_warnx("dispatch_rtmsg "
+				    "mpath route not found");
 				return (-1);
 			}
 			if (kroute_remove(kr) == -1)
@@ -1531,8 +1517,6 @@ add:
 			if ((ifam->ifam_addrs & (RTA_NETMASK | RTA_IFA |
 			    RTA_BRD)) == 0)
 				break;
-			sa = (struct sockaddr *)(ifam + 1);
-			get_rtaddrs(ifam->ifam_addrs, sa, rti_info);
 
 			if_newaddr(ifam->ifam_index,
 			    (struct sockaddr_in6 *)rti_info[RTAX_IFA],
@@ -1544,8 +1528,6 @@ add:
 			if ((ifam->ifam_addrs & (RTA_NETMASK | RTA_IFA |
 			    RTA_BRD)) == 0)
 				break;
-			sa = (struct sockaddr *)(ifam + 1);
-			get_rtaddrs(ifam->ifam_addrs, sa, rti_info);
 
 			if_deladdr(ifam->ifam_index,
 			    (struct sockaddr_in6 *)rti_info[RTAX_IFA],
@@ -1555,10 +1537,28 @@ add:
 		case RTM_IFANNOUNCE:
 			if_announce(next);
 			break;
+		case RTM_DESYNC:
+			/*
+			 * We lost some routing packets. Schedule a reload
+			 * of the kernel route/interface information.
+			 */
+			if (kr_state.reload_state == KR_RELOAD_IDLE) {
+				delay = KR_RELOAD_TIMER;
+				log_info("desync; scheduling fib reload");
+			} else {
+				delay = KR_RELOAD_HOLD_TIMER;
+				log_debug("desync during KR_RELOAD_%s",
+				    kr_state.reload_state ==
+				    KR_RELOAD_FETCH ? "FETCH" : "HOLD");
+			}
+			kr_state.reload_state = KR_RELOAD_FETCH;
+			kr_fib_reload_arm_timer(delay);
+			break;
 		default:
 			/* ignore for now */
 			break;
 		}
 	}
-	return (0);
+
+	return (offset);
 }
