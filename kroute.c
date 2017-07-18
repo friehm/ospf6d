@@ -38,7 +38,6 @@
 #include <limits.h>
 
 #include "ospf6d.h"
-#include "ospfe.h"
 #include "log.h"
 
 struct {
@@ -62,10 +61,17 @@ struct kroute_node {
 	int			 serial;
 };
 
+struct kif_node {
+	RB_ENTRY(kif_node)	 entry;
+	TAILQ_HEAD(, kif_addr)	 addrs;
+	struct kif		 k;
+};
+
 void	kr_redist_remove(struct kroute_node *, struct kroute_node *);
 int	kr_redist_eval(struct kroute *, struct kroute *);
 void	kr_redistribute(struct kroute_node *);
 int	kroute_compare(struct kroute_node *, struct kroute_node *);
+int	kif_compare(struct kif_node *, struct kif_node *);
 int	kr_change_fib(struct kroute_node *, struct kroute *, int, int);
 int	kr_delete_fib(struct kroute_node *);
 
@@ -77,8 +83,11 @@ int			 kroute_insert(struct kroute_node *);
 int			 kroute_remove(struct kroute_node *);
 void			 kroute_clear(void);
 
-struct iface		*kif_update(u_short, int, struct if_data *,
-			   struct sockaddr_dl *);
+struct kif_node		*kif_find(u_short);
+struct kif_node		*kif_insert(u_short);
+int			 kif_remove(struct kif_node *);
+struct kif		*kif_update(u_short, int, struct if_data *,
+			    struct sockaddr_dl *);
 int			 kif_validate(u_short);
 
 struct kroute_node	*kroute_match(struct in6_addr *);
@@ -95,6 +104,7 @@ void		if_announce(void *);
 int		send_rtmsg(int, int, struct kroute *);
 int		dispatch_rtmsg(void);
 int		fetchtable(void);
+int		fetchifs(u_short);
 int		rtmsg_process(char *, size_t);
 void		kr_fib_reload_timer(int, short, void *);
 void		kr_fib_reload_arm_timer(int);
@@ -102,6 +112,20 @@ void		kr_fib_reload_arm_timer(int);
 RB_HEAD(kroute_tree, kroute_node)	krt;
 RB_PROTOTYPE(kroute_tree, kroute_node, entry, kroute_compare)
 RB_GENERATE(kroute_tree, kroute_node, entry, kroute_compare)
+
+RB_HEAD(kif_tree, kif_node)		kit = RB_INITIALIZER(&kit);
+RB_PROTOTYPE(kif_tree, kif_node, entry, kif_compare)
+RB_GENERATE(kif_tree, kif_node, entry, kif_compare)
+
+int
+kif_init(void)
+{
+	if (fetchifs(0) == -1)
+		return (-1);
+
+	return (0);
+}
+
 
 int
 kr_init(int fs)
@@ -302,6 +326,7 @@ kr_shutdown(void)
 {
 	kr_fib_decouple();
 	kroute_clear();
+	kif_clear();
 }
 
 void
@@ -452,6 +477,20 @@ kr_show_route(struct imsg *imsg)
 	}
 
 	main_imsg_compose_ospfe(IMSG_CTL_END, imsg->hdr.pid, NULL, 0);
+}
+
+void
+kr_ifinfo(char *ifname, pid_t pid)
+{
+	struct kif_node	*kif;
+
+	RB_FOREACH(kif, kif_tree, &kit)
+		if (ifname == NULL || !strcmp(ifname, kif->k.ifname)) {
+			main_imsg_compose_ospfe(IMSG_CTL_IFINFO,
+			    pid, &kif->k, sizeof(kif->k));
+		}
+
+	main_imsg_compose_ospfe(IMSG_CTL_END, pid, NULL, 0);
 }
 
 void
@@ -621,6 +660,12 @@ kroute_compare(struct kroute_node *a, struct kroute_node *b)
 	return (0);
 }
 
+int
+kif_compare(struct kif_node *a, struct kif_node *b)
+{
+	return (b->k.ifindex - a->k.ifindex);
+}
+
 /* tree management */
 struct kroute_node *
 kroute_find(const struct in6_addr *prefix, u_int8_t prefixlen, u_int8_t prio)
@@ -748,21 +793,107 @@ kroute_clear(void)
 		kroute_remove(kr);
 }
 
-struct iface *
+struct kif_node *
+kif_find(u_short ifindex)
+{
+	struct kif_node	s;
+
+	bzero(&s, sizeof(s));
+	s.k.ifindex = ifindex;
+
+	return (RB_FIND(kif_tree, &kit, &s));
+}
+
+struct kif *
+kif_findname(char *ifname, struct kif_addr **kap)
+{
+	struct kif_node	*kif;
+	struct kif_addr	*ka;
+
+	RB_FOREACH(kif, kif_tree, &kit)
+		if (!strcmp(ifname, kif->k.ifname)) {
+			ka = TAILQ_FIRST(&kif->addrs);
+			if (kap != NULL)
+				*kap = ka;
+			return (&kif->k);
+		}
+
+	return (NULL);
+}
+
+struct kif_node *
+kif_insert(u_short ifindex)
+{
+	struct kif_node	*kif;
+
+	if ((kif = calloc(1, sizeof(struct kif_node))) == NULL)
+		return (NULL);
+
+	kif->k.ifindex = ifindex;
+	TAILQ_INIT(&kif->addrs);
+
+	if (RB_INSERT(kif_tree, &kit, kif) != NULL)
+		fatalx("kif_insert: RB_INSERT");
+
+	return (kif);
+}
+
+int
+kif_remove(struct kif_node *kif)
+{
+	struct kif_addr	*ka;
+
+	if (RB_REMOVE(kif_tree, &kit, kif) == NULL) {
+		log_warnx("RB_REMOVE(kif_tree, &kit, kif)");
+		return (-1);
+	}
+
+	while ((ka = TAILQ_FIRST(&kif->addrs)) != NULL) {
+		TAILQ_REMOVE(&kif->addrs, ka, entry);
+		free(ka);
+	}
+	free(kif);
+	return (0);
+}
+
+void
+kif_clear(void)
+{
+	struct kif_node	*kif;
+
+	while ((kif = RB_MIN(kif_tree, &kit)) != NULL)
+		kif_remove(kif);
+}
+
+struct kif *
 kif_update(u_short ifindex, int flags, struct if_data *ifd,
     struct sockaddr_dl *sdl)
 {
-	struct iface	*iface;
-	char		 ifname[IF_NAMESIZE];
+	struct kif_node		*kif;
 
-	if ((iface = if_find(ifindex)) == NULL) {
-		bzero(ifname, sizeof(ifname));
-		if (sdl && sdl->sdl_family == AF_LINK) {
-			if (sdl->sdl_nlen >= sizeof(ifname))
-				memcpy(ifname, sdl->sdl_data,
-				    sizeof(ifname) - 1);
-			else if (sdl->sdl_nlen > 0)
-				memcpy(ifname, sdl->sdl_data, sdl->sdl_nlen);
+	if ((kif = kif_find(ifindex)) == NULL) {
+		if ((kif = kif_insert(ifindex)) == NULL)
+			return (NULL);
+
+	kif->k.flags = flags;
+	kif->k.link_state = ifd->ifi_link_state;
+	kif->k.if_type = ifd->ifi_type;
+	kif->k.baudrate = ifd->ifi_baudrate;
+	kif->k.mtu = ifd->ifi_mtu;
+	kif->k.rdomain = ifd->ifi_rdomain;
+
+	if (sdl && sdl->sdl_family == AF_LINK) {
+		if (sdl->sdl_nlen >= sizeof(kif->k.ifname))
+			memcpy(kif->k.ifname, sdl->sdl_data,
+			    sizeof(kif->k.ifname) - 1);
+		else if (sdl->sdl_nlen > 0)
+			memcpy(kif->k.ifname, sdl->sdl_data,
+			    sdl->sdl_nlen);
+		/* string already terminated via calloc() */
+	}
+
+	return (&kif->k);
+}
 			else
 				return (NULL);
 		} else
@@ -781,9 +912,9 @@ kif_update(u_short ifindex, int flags, struct if_data *ifd,
 int
 kif_validate(u_short ifindex)
 {
-	struct iface	*iface;
+	struct kif_node		*kif;
 
-	if ((iface = if_find(ifindex)) == NULL) {
+	if ((kif = kif_find(ifindex)) == NULL) {
 		log_warnx("interface with index %u not found", ifindex);
 		return (-1);
 	}
@@ -855,16 +986,16 @@ void
 if_change(u_short ifindex, int flags, struct if_data *ifd)
 {
 	struct kroute_node	*kr, *tkr;
-	struct iface		*iface;
+	struct kif		*kif;
 	u_int8_t		 wasvalid, isvalid;
 
 	wasvalid = kif_validate(ifindex);
 
-	if ((iface = kif_update(ifindex, flags, ifd, NULL)) == NULL) {
+	if ((kif = kif_update(ifindex, flags, ifd, NULL)) == NULL) {
 		log_warn("if_change: kif_update(%u)", ifindex);
 		return;
 	}
-
+XXXX
 	/* inform engine and rde about state change if interface is used */
 	if (iface->cflags & F_IFACE_CONFIGURED) {
 		main_imsg_compose_ospfe(IMSG_IFINFO, 0, iface,
@@ -898,13 +1029,13 @@ void
 if_newaddr(u_short ifindex, struct sockaddr_in6 *ifa, struct sockaddr_in6 *mask,
     struct sockaddr_in6 *brd)
 {
-	struct iface		*iface;
-	struct iface_addr	*ia;
+	struct kif_node *kif;
+	struct kif_addr *ka;
 	struct ifaddrchange	 ifc;
 
 	if (ifa == NULL || ifa->sin6_family != AF_INET6)
 		return;
-	if ((iface = if_find(ifindex)) == NULL) {
+	if ((kif = kif_find(ifindex)) == NULL) {
 		log_warnx("if_newaddr: corresponding if %d not found", ifindex);
 		return;
 	}
@@ -918,25 +1049,21 @@ if_newaddr(u_short ifindex, struct sockaddr_in6 *ifa, struct sockaddr_in6 *mask,
 	    IN6_IS_ADDR_V4COMPAT(&ifa->sin6_addr))
 		return;
 
-	clearscope(&ifa->sin6_addr);
-
-	if (IN6_IS_ADDR_LINKLOCAL(&ifa->sin6_addr) ||
-	    iface->flags & IFF_LOOPBACK)
-		iface->addr = ifa->sin6_addr;
-
-	if ((ia = calloc(1, sizeof(struct iface_addr))) == NULL)
+	if ((ka = calloc(1, sizeof(struct kif_addr))) == NULL)
 		fatal("if_newaddr");
-
-	ia->addr = ifa->sin6_addr;
+	clearscope(&ifa->sin6_addr);
+	ka->addr = ifa->sin6_addr;
 
 	if (mask)
-		ia->prefixlen = mask2prefixlen(mask);
+		ka->mask = mask->sin6_addr;
 	else
-		ia->prefixlen = 0;
+		bzero(&ka->mask, sizeof(ka->mask));
+		ka->mask.s_addr = INADDR_NONE;
 	if (brd && brd->sin6_family == AF_INET6)
-		ia->dstbrd = brd->sin6_addr;
+		ka->dstbrd = brd->sin6_addr;
 	else
-		bzero(&ia->dstbrd, sizeof(ia->dstbrd));
+		kj
+		bzero(&ka->dstbrd, sizeof(ia->dstbrd));
 
 	switch (iface->type) {
 	case IF_TYPE_BROADCAST:

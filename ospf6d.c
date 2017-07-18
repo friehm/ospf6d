@@ -175,8 +175,8 @@ main(int argc, char *argv[])
 		opts |= OSPFD_OPT_STUB_ROUTER;
 	}
 
-	/* prepare and fetch interfaces early */
-	if_init();
+	/* fetch interfaces early */
+	kif_init();
 
 	/* parse config file */
 	if ((ospfd_conf = parse_config(conffile, opts)) == NULL )

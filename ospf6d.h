@@ -273,26 +273,16 @@ enum rib_type {
 	RIB_EXT
 };
 
-struct iface_addr {
-	TAILQ_ENTRY(iface_addr)	 entry;
-	struct in6_addr		 addr;
-	struct in6_addr		 dstbrd;
-	u_int8_t		 prefixlen;
-	u_int8_t		 redistribute;
-};
-
 /* lsa list used in RDE and OE */
 TAILQ_HEAD(lsa_head, lsa_entry);
 
 struct iface {
 	LIST_ENTRY(iface)	 entry;
-	TAILQ_ENTRY(iface)	 list;
 	struct event		 hello_timer;
 	struct event		 wait_timer;
 	struct event		 lsack_tx_timer;
 
 	LIST_HEAD(, nbr)	 nbr_list;
-	TAILQ_HEAD(, iface_addr) ifa_list;
 	struct lsa_head		 ls_ack_list;
 
 	struct lsa_tree		 lsa_tree;	/* LSA with link local scope */
@@ -397,6 +387,25 @@ struct kroute {
 	u_int8_t	prefixlen;
 	u_int8_t	priority;
 };
+
+struct kif_addr {
+	TAILQ_ENTRY(kif_addr)	 entry;
+	struct in6_addr		 addr;
+	struct in6_addr		 mask;
+	struct in6_addr		 dstbrd;
+};
+
+struct kif {
+	char			 ifname[IF_NAMESIZE];
+	u_int64_t		 baudrate;
+	int			 flags;
+	int			 mtu;
+	unsigned int		 ifindex;
+	u_int8_t		 if_type;
+	u_int8_t		 link_state;
+	u_int8_t		 nh_reachable;	/* for nexthop verification */
+};
+
 
 /* name2id */
 struct n2id_label {
@@ -516,14 +525,6 @@ int		 carp_demote_set(char *, int);
 struct ospfd_conf	*parse_config(char *, int);
 int			 cmdline_symset(char *);
 
-/* interface.c */
-int		 if_init(void);
-struct iface	*if_find(unsigned int);
-struct iface	*if_findname(char *);
-struct iface	*if_new(u_short, char *);
-void		 if_update(struct iface *, int, int, u_int8_t, u_int8_t,
-		    u_int64_t);
-
 /* in_cksum.c */
 u_int16_t	 in_cksum(void *, size_t);
 
@@ -531,6 +532,7 @@ u_int16_t	 in_cksum(void *, size_t);
 u_int16_t	 iso_cksum(void *, u_int16_t, u_int16_t);
 
 /* kroute.c */
+int		 kif_init(void);
 int		 kr_init(int);
 int		 kr_change(struct kroute *, int);
 int		 kr_delete(struct kroute *);
@@ -540,6 +542,8 @@ void		 kr_fib_decouple(void);
 void		 kr_fib_reload(void);
 void		 kr_dispatch_msg(int, short, void *);
 void		 kr_show_route(struct imsg *);
+void		 kr_ifinfo(char *, pid_t);
+struct kif	*kif_findname(char *, struct kif_addr **);
 void		 kr_reload(void);
 
 void		 embedscope(struct sockaddr_in6 *);
@@ -549,8 +553,6 @@ void		 clearscope(struct in6_addr *);
 u_int8_t	 mask2prefixlen(struct sockaddr_in6 *);
 struct in6_addr	*prefixlen2mask(u_int8_t);
 void		inet6applymask(struct in6_addr *, const struct in6_addr *, int);
-
-int		fetchifs(u_short);
 
 /* logmsg.h */
 const char	*log_in6addr(const struct in6_addr *);

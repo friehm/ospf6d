@@ -73,8 +73,6 @@ struct {
 static int vlink_cnt = 0;
 #endif
 
-TAILQ_HEAD(, iface)	iflist;
-
 const char * const if_event_names[] = {
 	"NOTHING",
 	"UP",
@@ -166,41 +164,8 @@ if_fsm(struct iface *iface, enum iface_event event)
 	return (ret);
 }
 
-int
-if_init(void)
-{
-	TAILQ_INIT(&iflist);
-
-	return (fetchifs(0));
-}
-
-/* XXX using a linked list should be OK for now */
 struct iface *
-if_find(unsigned int ifindex)
-{
-	struct iface	*iface;
-
-	TAILQ_FOREACH(iface, &iflist, list) {
-		if (ifindex == iface->ifindex)
-			return (iface);
-	}
-	return (NULL);
-}
-
-struct iface *
-if_findname(char *name)
-{
-	struct iface	*iface;
-
-	TAILQ_FOREACH(iface, &iflist, list) {
-		if (!strcmp(name, iface->name))
-			return (iface);
-	}
-	return (NULL);
-}
-
-struct iface *
-if_new(u_short ifindex, char *ifname)
+if_new(struct kif *kif, struct kif_addr *ka)
 {
 	struct iface		*iface;
 
@@ -210,7 +175,6 @@ if_new(u_short ifindex, char *ifname)
 	iface->state = IF_STA_DOWN;
 
 	LIST_INIT(&iface->nbr_list);
-	TAILQ_INIT(&iface->ifa_list);
 	TAILQ_INIT(&iface->ls_ack_list);
 	RB_INIT(&iface->lsa_tree);
 
@@ -225,33 +189,34 @@ if_new(u_short ifindex, char *ifname)
 		return (iface);
 	}
 #endif
-	strlcpy(iface->name, ifname, sizeof(iface->name));
-	iface->ifindex = ifindex;
+	strlcpy(iface->name, kif->ifname, sizeof(iface->name));
 
-	TAILQ_INSERT_TAIL(&iflist, iface, list);
-
-	return (iface);
-}
-
-void
-if_update(struct iface *iface, int mtu, int flags, u_int8_t type,
-    u_int8_t state, u_int64_t rate)
-{
-	iface->mtu = mtu;
-	iface->flags = flags;
-	iface->if_type = type;
-	iface->linkstate = state;
-	iface->baudrate = rate;
-
-	/* set type */
-	if (flags & IFF_POINTOPOINT)
+	/* get type */
+	if (kif->flags & IFF_POINTOPOINT)
 		iface->type = IF_TYPE_POINTOPOINT;
-	if (flags & IFF_BROADCAST && flags & IFF_MULTICAST)
+	if (kif->flags & IFF_BROADCAST &&
+	    kif->flags & IFF_MULTICAST)
 		iface->type = IF_TYPE_BROADCAST;
-	if (flags & IFF_LOOPBACK) {
+	if (kif->flags & IFF_LOOPBACK) {
 		iface->type = IF_TYPE_POINTOPOINT;
 		iface->cflags |= F_IFACE_PASSIVE;
 	}
+
+	/* get mtu, index and flags */
+	iface->mtu = kif->mtu;
+	iface->ifindex = kif->ifindex;
+	iface->flags = kif->flags;
+	iface->linkstate = kif->link_state;
+	iface->if_type = kif->if_type;
+	iface->baudrate = kif->baudrate;
+
+	/* set address, mask and p2p addr */
+	iface->addr = ka->addr;
+	if (kif->flags & IFF_POINTOPOINT) {
+		iface->dst = ka->dstbrd;
+	}
+
+	return (iface);
 }
 
 void
@@ -277,7 +242,6 @@ if_del(struct iface *iface)
 		evtimer_del(&iface->lsack_tx_timer);
 
 	ls_ack_list_clr(iface);
-	TAILQ_REMOVE(&iflist, iface, list);
 	free(iface);
 }
 
