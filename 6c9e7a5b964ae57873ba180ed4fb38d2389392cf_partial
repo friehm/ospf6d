@@ -1,0 +1,941 @@
+commit 6c9e7a5b964ae57873ba180ed4fb38d2389392cf
+Author: claudio <claudio@openbsd.org>
+Date:   Thu Dec 13 08:54:05 2007 +0000
+
+    Monster commit of stuff I did mostly last month. What it does:
+     * removes kif and uses iface for everything interface related.
+       This removes unneeded data redundancy which makes the code more complex.
+     * adds the link local prefix to struct iface and attaches a list with
+       the other prefixes to the struct iface. This is needed to generate the
+       link LSA.
+     * disconnects struct iface from struct area (the backpointer is gone)
+       this will make the reload code a bit easier.
+    norby@ agrees with the direction we're heading with this
+
+diff --git a/usr.sbin/ospf6d/control.c b/usr.sbin/ospf6d/control.c
+index 53ecd7672c8..1155b4fe19f 100644
+--- a/usr.sbin/ospf6d/control.c
++++ b/usr.sbin/ospf6d/control.c
+@@ -231,7 +231,6 @@ control_dispatch_imsg(int fd, short event, void *bula)
+ 			break;
+ 		case IMSG_CTL_KROUTE:
+ 		case IMSG_CTL_KROUTE_ADDR:
+-		case IMSG_CTL_IFINFO:
+ 			c->ibuf.pid = imsg.hdr.pid;
+ 			ospfe_imsg_compose_parent(imsg.hdr.type,
+ 			    imsg.hdr.pid, imsg.data,
+diff --git a/usr.sbin/ospf6d/database.c b/usr.sbin/ospf6d/database.c
+index a26b9f54bd6..8c494f8519d 100644
+--- a/usr.sbin/ospf6d/database.c
++++ b/usr.sbin/ospf6d/database.c
+@@ -136,7 +136,7 @@ send_db_description(struct nbr *nbr)
+ 		fatalx("send_db_description: unknown interface type");
+ 	}
+ 
+-	dd_hdr.opts = area_ospf_options(nbr->iface->area);
++	dd_hdr.opts = area_ospf_options(area_find(oeconf, nbr->iface->area_id));
+ 	dd_hdr.bits = bits;
+ 	dd_hdr.dd_seq_num = htonl(nbr->dd_seq_num);
+ 
+diff --git a/usr.sbin/ospf6d/hello.c b/usr.sbin/ospf6d/hello.c
+index a59f347cb7e..3face36474d 100644
+--- a/usr.sbin/ospf6d/hello.c
++++ b/usr.sbin/ospf6d/hello.c
+@@ -74,7 +74,7 @@ send_hello(struct iface *iface)
+ 	hello.iface_id = iface->ifindex;
+ 	hello.rtr_priority = iface->priority;
+ 
+-	opts = ntohl(area_ospf_options(iface->area));
++	opts = ntohl(area_ospf_options(area_find(oeconf, iface->area_id)));
+ 	hello.opts1 = (opts >> 16) & 0xff;
+ 	hello.opts2 = (opts >> 8) & 0xff;
+ 	hello.opts3 = opts & 0xff;
+@@ -123,6 +123,7 @@ recv_hello(struct iface *iface, struct in6_addr *src, u_int32_t rtr_id,
+ {
+ 	struct hello_hdr	 hello;
+ 	struct nbr		*nbr = NULL, *dr;
++	struct area		*area;
+ 	u_int32_t		 nbr_id;
+ 	int			 nbr_change = 0;
+ 
+@@ -150,8 +151,11 @@ recv_hello(struct iface *iface, struct in6_addr *src, u_int32_t rtr_id,
+ 		return;
+ 	}
+ 
+-	if ((hello.opts3 & OSPF_OPTION_E && iface->area->stub) ||		/* XXX */
+-	    ((hello.opts3 & OSPF_OPTION_E) == 0 && !iface->area->stub)) {	/* XXX */
++	if ((area = area_find(oeconf, iface->area_id)) == NULL)
++		fatalx("interface lost area");
++
++	if ((hello.opts3 & OSPF_OPTION_E && area->stub) ||		/* XXX */
++	    ((hello.opts3 & OSPF_OPTION_E) == 0 && !area->stub)) {	/* XXX */
+ 		log_warnx("recv_hello: ExternalRoutingCapability mismatch, "
+ 		    "interface %s", iface->name);
+ 		return;
+diff --git a/usr.sbin/ospf6d/interface.c b/usr.sbin/ospf6d/interface.c
+index a527d88a72f..76d859aa050 100644
+--- a/usr.sbin/ospf6d/interface.c
++++ b/usr.sbin/ospf6d/interface.c
+@@ -138,7 +140,7 @@ if_fsm(struct iface *iface, enum iface_event event)
+ 		iface->state = new_state;
+ 
+ 	if (iface->state != old_state)
+-		orig_rtr_lsa(iface->area);
++		orig_rtr_lsa(iface);
+ 
+ 	if (old_state & (IF_STA_MULTI | IF_STA_POINTTOPOINT) &&
+ 	    (iface->state & (IF_STA_MULTI | IF_STA_POINTTOPOINT)) == 0)
+@@ -231,11 +266,12 @@ if_del(struct iface *iface)
+ 		evtimer_del(&iface->lsack_tx_timer);
+ 
+ 	ls_ack_list_clr(iface);
++	TAILQ_REMOVE(&iflist, iface, list);
+ 	free(iface);
+ }
+ 
+ void
+-if_init(struct ospfd_conf *xconf, struct iface *iface)
++if_start(struct ospfd_conf *xconf, struct iface *iface)
+ {
+ 	/* init the dummy local neighbor */
+ 	iface->self = nbr_new(ospfe_router_id(), iface, 1);
+@@ -248,6 +284,9 @@ if_init(struct ospfd_conf *xconf, struct iface *iface)
+ 	iface->fd = xconf->ospf_socket;
+ 
+ 	ospfe_demote_iface(iface, 0);
++
++	if (if_fsm(iface, IF_EVT_UP))
++		log_debug("error starting interface %s", iface->name);
+ }
+ 
+ /* timers */
+@@ -327,16 +366,17 @@ if_act_start(struct iface *iface)
+ 		return (0);
+ 	}
+ 
+-	if (iface->media_type == IFT_CARP && iface->passive == 0) {
++	if (iface->media_type == IFT_CARP &&
++	    !(iface->cflags & F_IFACE_PASSIVE)) {
+ 		/* force passive mode on carp interfaces */
+ 		log_warnx("if_act_start: forcing interface %s to passive",
+ 		    iface->name);
+-		iface->passive = 1;
++		iface->cflags |= F_IFACE_PASSIVE;
+ 	}
+ 
+-	if (iface->passive) {
++	if (iface->cflags & F_IFACE_PASSIVE) {
+ 		/* for an update of stub network entries */
+-		orig_rtr_lsa(iface->area);
++		orig_rtr_lsa(iface);
+ 		return (0);
+ 	}
+ 
+@@ -513,7 +553,7 @@ start:
+ 				nbr_fsm(nbr, NBR_EVT_ADJ_OK);
+ 		}
+ 
+-		orig_rtr_lsa(iface->area);
++		orig_rtr_lsa(iface);
+ 		if (iface->state & IF_STA_DR || old_state & IF_STA_DR)
+ 			orig_net_lsa(iface);
+ 	}
+@@ -528,9 +568,9 @@ if_act_reset(struct iface *iface)
+ 	struct nbr		*nbr = NULL;
+ 	struct in6_addr		 addr;
+ 
+-	if (iface->passive) {
++	if (iface->cflags & F_IFACE_PASSIVE) {
+ 		/* for an update of stub network entries */
+-		orig_rtr_lsa(iface->area);
++		orig_rtr_lsa(iface);
+ 		return (0);
+ 	}
+ 
+@@ -594,7 +634,7 @@ if_to_ctl(struct iface *iface)
+ 	memcpy(ictl.name, iface->name, sizeof(ictl.name));
+ 	memcpy(&ictl.addr, &iface->addr, sizeof(ictl.addr));
+ 	ictl.rtr_id.s_addr = ospfe_router_id();
+-	memcpy(&ictl.area, &iface->area->id, sizeof(ictl.area));
++	memcpy(&ictl.area, &iface->area_id, sizeof(ictl.area));
+ 	if (iface->dr) {
+ 		memcpy(&ictl.dr_id, &iface->dr->id, sizeof(ictl.dr_id));
+ 		memcpy(&ictl.dr_addr, &iface->dr->addr, sizeof(ictl.dr_addr));
+@@ -626,7 +666,7 @@ if_to_ctl(struct iface *iface)
+ 	ictl.linkstate = iface->linkstate;
+ 	ictl.mediatype = iface->media_type;
+ 	ictl.priority = iface->priority;
+-	ictl.passive = iface->passive;
++	ictl.passive = (iface->cflags & F_IFACE_PASSIVE) == F_IFACE_PASSIVE;
+ 
+ 	gettimeofday(&now, NULL);
+ 	if (evtimer_pending(&iface->hello_timer, &tv)) {
+diff --git a/usr.sbin/ospf6d/kroute.c b/usr.sbin/ospf6d/kroute.c
+index 52f65f501ee..df80f157c1d 100644
+--- a/usr.sbin/ospf6d/kroute.c
++++ b/usr.sbin/ospf6d/kroute.c
+@@ -907,26 +787,28 @@ void
+ if_change(u_short ifindex, int flags, struct if_data *ifd)
+ {
+ 	struct kroute_node	*kr, *tkr;
+-	struct kif		*kif;
++	struct iface		*iface;
+ 	u_int8_t		 reachable;
+ 
+-	if ((kif = kif_update(ifindex, flags, ifd, NULL)) == NULL) {
++	if ((iface = kif_update(ifindex, flags, ifd, NULL)) == NULL) {
+ 		log_warn("if_change:  kif_update(%u)", ifindex);
+ 		return;
+ 	}
+ 
+-	reachable = (kif->flags & IFF_UP) &&
+-	    (LINK_STATE_IS_UP(kif->link_state) ||
+-	    (kif->link_state == LINK_STATE_UNKNOWN &&
+-	    kif->media_type != IFT_CARP));
++	reachable = (iface->flags & IFF_UP) &&
++	    (LINK_STATE_IS_UP(iface->linkstate) ||
++	    (iface->linkstate == LINK_STATE_UNKNOWN &&
++	    iface->media_type != IFT_CARP));
+ 
+-	if (reachable == kif->nh_reachable)
++	if (reachable == iface->nh_reachable)
+ 		return;		/* nothing changed wrt nexthop validity */
+ 
+-	kif->nh_reachable = reachable;
++	iface->nh_reachable = reachable;
+ 
+ 	/* notify ospfe about interface link state */
+-	main_imsg_compose_ospfe(IMSG_IFINFO, 0, kif, sizeof(struct kif));
++	if (iface->cflags & F_IFACE_CONFIGURED)
++		main_imsg_compose_ospfe(IMSG_IFINFO, 0, iface,
++		    sizeof(struct iface));
+ 
+ 	/* update redistribute list */
+ 	RB_FOREACH(kr, kroute_tree, &krt) {
+@@ -947,56 +829,69 @@ void
+ if_newaddr(u_short ifindex, struct sockaddr_in6 *ifa, struct sockaddr_in6 *mask,
+     struct sockaddr_in6 *brd)
+ {
+-	struct kif_node *kif;
+-	struct kif_addr *ka;
++	struct iface		*iface;
++	struct iface_addr	*ia;
+ 
+ 	if (ifa == NULL || ifa->sin6_family != AF_INET6)
+ 		return;
+-	if ((kif = kif_find(ifindex)) == NULL) {
++	if ((iface = if_find(ifindex)) == NULL) {
+ 		log_warnx("if_newaddr: corresponding if %i not found", ifindex);
+ 		return;
+ 	}
+-	if ((ka = calloc(1, sizeof(struct kif_addr))) == NULL)
+-		fatal("if_newaddr");
+-	ka->addr = ifa->sin6_addr;
+-
+ 	/* XXX thanks, KAME, for this ugliness... adopted from route/show.c */
+-	if (IN6_IS_ADDR_LINKLOCAL(&ka->addr) ||
+-	    IN6_IS_ADDR_MC_LINKLOCAL(&ka->addr)) {
+-		ka->addr.s6_addr[2] = 0;
+-		ka->addr.s6_addr[3] = 0;
++	if (IN6_IS_ADDR_LINKLOCAL(&ifa->sin6_addr) ||
++	    IN6_IS_ADDR_MC_LINKLOCAL(&ifa->sin6_addr)) {
++		ifa->sin6_addr.s6_addr[2] = 0;
++		ifa->sin6_addr.s6_addr[3] = 0;
+ 	}
+ 
++	if (IN6_IS_ADDR_LINKLOCAL(&ifa->sin6_addr))
++		iface->addr = ifa->sin6_addr;
++
++	if ((ia = calloc(1, sizeof(struct iface_addr))) == NULL)
++		fatal("if_newaddr");
++
++	ia->addr = ifa->sin6_addr;
++
+ 	if (mask)
+-		ka->mask = mask->sin6_addr;
++		ia->prefixlen = 64; // XXX mask2prefixlen(&mask->sin6_addr);
+ 	else
+-		bzero(&ka->mask, sizeof(ka->mask));
++		ia->prefixlen = 0;
++#if 0 /* XXX fix me */
+ 	if (brd)
+ 		ka->dstbrd = brd->sin6_addr;
+ 	else
+ 		bzero(&ka->dstbrd, sizeof(ka->dstbrd));
++#endif
+ 
+ 	log_debug("if_newaddr: ifindex %u, addr %s", ifindex,
+-	    log_in6addr(&ka->addr));
+-	TAILQ_INSERT_TAIL(&kif->addrs, ka, entry);
++	    log_in6addr(&ia->addr));
++	TAILQ_INSERT_TAIL(&iface->ifa_list, ia, entry);
+ }
+ 
+ void
+ if_announce(void *msg)
+ {
+ 	struct if_announcemsghdr	*ifan;
+-	struct kif_node			*kif;
++	struct iface			*iface;
+ 
+ 	ifan = msg;
+ 
+ 	switch (ifan->ifan_what) {
+ 	case IFAN_ARRIVAL:
+-		kif = kif_insert(ifan->ifan_index);
+-		strlcpy(kif->k.ifname, ifan->ifan_name, sizeof(kif->k.ifname));
++		if ((iface = if_new(ifan->ifan_index, ifan->ifan_name)) == NULL)
++			fatal("if_new failed");
++		iface->cflags |= F_IFACE_AVAIL;
+ 		break;
+ 	case IFAN_DEPARTURE:
+-		kif = kif_find(ifan->ifan_index);
+-		kif_remove(kif);
++		iface = if_find(ifan->ifan_index);
++		if (iface->cflags & F_IFACE_CONFIGURED) {
++			main_imsg_compose_rde(IMSG_IFDELETE, 0,
++			    &iface->ifindex, sizeof(iface->ifindex));
++			main_imsg_compose_ospfe(IMSG_IFDELETE, 0,
++			    &iface->ifindex, sizeof(iface->ifindex));
++		}
++		if_del(iface);
+ 		break;
+ 	}
+ }
+@@ -1234,7 +1129,7 @@ fetchifs(u_short ifindex)
+ 	struct rt_msghdr	*rtm;
+ 	struct if_msghdr	 ifm;
+ 	struct ifa_msghdr	*ifam;
+-	struct kif		*kif = NULL;
++	struct iface		*iface;
+ 	struct sockaddr		*sa, *rti_info[RTAX_MAX];
+ 
+ 	mib[0] = CTL_NET;
+@@ -1269,12 +1164,12 @@ fetchifs(u_short ifindex)
+ 			sa = (struct sockaddr *)(next + sizeof(ifm));
+ 			get_rtaddrs(ifm.ifm_addrs, sa, rti_info);
+ 
+-			if ((kif = kif_update(ifm.ifm_index,
++			if ((iface = kif_update(ifm.ifm_index,
+ 			    ifm.ifm_flags, &ifm.ifm_data,
+ 			    (struct sockaddr_dl *)rti_info[RTAX_IFP])) == NULL)
+ 				fatal("fetchifs");
+ 
+-			kif->nh_reachable = (kif->flags & IFF_UP) &&
++			iface->nh_reachable = (iface->flags & IFF_UP) &&
+ 			    (LINK_STATE_IS_UP(ifm.ifm_data.ifi_link_state) ||
+ 			    (ifm.ifm_data.ifi_link_state ==
+ 			    LINK_STATE_UNKNOWN &&
+diff --git a/usr.sbin/ospf6d/neighbor.c b/usr.sbin/ospf6d/neighbor.c
+index 8352803c0ef..9e5f77199aa 100644
+--- a/usr.sbin/ospf6d/neighbor.c
++++ b/usr.sbin/ospf6d/neighbor.c
+@@ -200,12 +200,14 @@ nbr_fsm(struct nbr *nbr, enum nbr_event event)
+ 		    nbr->peerid, 0, &new_state, sizeof(new_state));
+ 
+ 		if (old_state & NBR_STA_FULL || nbr->state & NBR_STA_FULL) {
++			extern struct ospfd_conf        *oeconf; /* XXX */
+ 			/*
+ 			 * neighbor changed from/to FULL
+ 			 * originate new rtr and net LSA
+ 			 */
+-			area_track(nbr->iface->area, nbr->state);
+-			orig_rtr_lsa(nbr->iface->area);
++			area_track(area_find(oeconf, nbr->iface->area_id),
++			    nbr->state);
++			orig_rtr_lsa(nbr->iface);
+ 			if (nbr->iface->state & IF_STA_DR)
+ 				orig_net_lsa(nbr->iface);
+ 
+@@ -225,7 +227,7 @@ nbr_fsm(struct nbr *nbr, enum nbr_event event)
+ 		    nbr_state_name(nbr->state));
+ 
+ 		if (nbr->iface->type == IF_TYPE_VIRTUALLINK) {
+-			orig_rtr_lsa(nbr->iface->area);
++			orig_rtr_lsa(nbr->iface);
+ 		}
+ 	}
+ 
+@@ -313,7 +315,7 @@ nbr_new(u_int32_t nbr_id, struct iface *iface, int self)
+ 
+ 	bzero(&rn, sizeof(rn));
+ 	rn.id.s_addr = nbr->id.s_addr;
+-	rn.area_id.s_addr = nbr->iface->area->id.s_addr;
++	rn.area_id.s_addr = nbr->iface->area_id.s_addr;
+ 	rn.ifindex = nbr->iface->ifindex;
+ 	rn.state = nbr->state;
+ 	rn.self = self;
+@@ -644,7 +646,7 @@ nbr_to_ctl(struct nbr *nbr)
+ 	memcpy(&nctl.addr, &nbr->addr, sizeof(nctl.addr));
+ 	memcpy(&nctl.dr, &nbr->dr, sizeof(nctl.dr));
+ 	memcpy(&nctl.bdr, &nbr->bdr, sizeof(nctl.bdr));
+-	memcpy(&nctl.area, &nbr->iface->area->id, sizeof(nctl.area));
++	memcpy(&nctl.area, &nbr->iface->area_id, sizeof(nctl.area));
+ 
+ 	/* this list is 99% of the time empty so that's OK for now */
+ 	nctl.db_sum_lst_cnt = 0;
+diff --git a/usr.sbin/ospf6d/ospf6d.c b/usr.sbin/ospf6d/ospf6d.c
+index ea5f66a2171..8aa87b3f003 100644
+--- a/usr.sbin/ospf6d/ospf6d.c
++++ b/usr.sbin/ospf6d/ospf6d.c
+@@ -127,7 +127,6 @@ int
+ main(int argc, char *argv[])
+ {
+ 	struct event		 ev_sigint, ev_sigterm, ev_sigchld, ev_sighup;
+-	struct area		*a;
+ 	int			 ch, opts = 0;
+ 	int			 debug = 0;
+ 	int			 ipforwarding;
+@@ -276,12 +275,6 @@ main(int argc, char *argv[])
+ 	if (kr_init(!(ospfd_conf->flags & OSPFD_FLAG_NO_FIB_UPDATE)) == -1)
+ 		fatalx("kr_init failed");
+ 
+-	/* remove unneded stuff from config */
+-	while ((a = LIST_FIRST(&ospfd_conf->area_list)) != NULL) {
+-		LIST_REMOVE(a, entry);
+-		area_del(a);
+-	}
+-
+ 	/* redistribute default */
+ 	ospf_redistribute_default(IMSG_NETWORK_ADD);
+ 
+@@ -394,14 +387,6 @@ main_dispatch_ospfe(int fd, short event, void *bula)
+ 		case IMSG_CTL_KROUTE_ADDR:
+ 			kr_show_route(&imsg);
+ 			break;
+-		case IMSG_CTL_IFINFO:
+-			if (imsg.hdr.len == IMSG_HEADER_SIZE)
+-				kr_ifinfo(NULL, imsg.hdr.pid);
+-			else if (imsg.hdr.len == IMSG_HEADER_SIZE + IFNAMSIZ)
+-				kr_ifinfo(imsg.data, imsg.hdr.pid);
+-			else
+-				log_warnx("IFINFO request with wrong len");
+-			break;
+ 		case IMSG_DEMOTE:
+ 			if (imsg.hdr.len - IMSG_HEADER_SIZE != sizeof(dmsg))
+ 				fatalx("invalid size of OE request");
+@@ -591,20 +575,17 @@ ospf_reload(void)
+ 	if (ospf_sendboth(IMSG_RECONF_CONF, xconf, sizeof(*xconf)) == -1)
+ 		return (-1);
+ 
+-	/* send interfaces */
++	/* send areas, interfaces happen out of band */
+ 	LIST_FOREACH(area, &xconf->area_list, entry) {
+ 		if (ospf_sendboth(IMSG_RECONF_AREA, area, sizeof(*area)) == -1)
+ 			return (-1);
+-
+-		LIST_FOREACH(iface, &area->iface_list, entry)
+-			if (ospf_sendboth(IMSG_RECONF_IFACE, iface,
+-			    sizeof(*iface)) == -1)
+-				return (-1);
+ 	}
+ 
+ 	if (ospf_sendboth(IMSG_RECONF_END, NULL, 0) == -1)
+ 		return (-1);
+ 
++	/* XXX send newly available interfaces to the childs */
++
+ 	merge_config(ospfd_conf, xconf);
+ 	/* update redistribute lists */
+ 	kr_reload();
+@@ -669,14 +650,8 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
+ 			if (ospfd_process == PROC_OSPF_ENGINE) {
+ 				/* start interfaces */
+ 				ospfe_demote_area(xa, 0);
+-				LIST_FOREACH(iface, &xa->iface_list, entry) {
+-					if_init(conf, iface);
+-					if (if_fsm(iface, IF_EVT_UP)) {
+-						log_debug("error starting "
+-						    "interface %s",
+-						    iface->name);
+-					}
+-				}
++				LIST_FOREACH(iface, &xa->iface_list, entry)
++					if_start(conf, iface);
+ 			}
+ 			/* no need to merge interfaces */
+ 			continue;
+@@ -701,17 +676,12 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
+ 			LIST_FOREACH(iface, &a->iface_list, entry) {
+ 				if (iface->state == IF_STA_NEW) {
+ 					iface->state = IF_STA_DOWN;
+-					if_init(conf, iface);
+-					if (if_fsm(iface, IF_EVT_UP)) {
+-						log_debug("error starting "
+-						    "interface %s",
+-						    iface->name);
+-					}
++					if_start(conf, iface);
+ 				}
+ 			}
+ 			if (a->dirty) {
+ 				a->dirty = 0;
+-				orig_rtr_lsa(a);
++				orig_rtr_lsa(LIST_FIRST(&a->iface_list));
+ 			}
+ 		}
+ 	}
+@@ -757,7 +727,6 @@ merge_interfaces(struct area *a, struct area *xa)
+ 			    xi->name);
+ 			LIST_REMOVE(xi, entry);
+ 			LIST_INSERT_HEAD(&a->iface_list, xi, entry);
+-			xi->area = a;
+ 			if (ospfd_process == PROC_OSPF_ENGINE)
+ 				xi->state = IF_STA_NEW;
+ 			continue;
+diff --git a/usr.sbin/ospf6d/ospf6d.h b/usr.sbin/ospf6d/ospf6d.h
+index 9bd40eb3319..9b817e8eb39 100644
+--- a/usr.sbin/ospf6d/ospf6d.h
++++ b/usr.sbin/ospf6d/ospf6d.h
+@@ -118,12 +118,13 @@ enum imsg_type {
+ 	IMSG_CTL_IFACE,
+ 	IMSG_CTL_KROUTE,
+ 	IMSG_CTL_KROUTE_ADDR,
+-	IMSG_CTL_IFINFO,
+ 	IMSG_CTL_END,
+ 	IMSG_KROUTE_CHANGE,
+ 	IMSG_KROUTE_DELETE,
+ 	IMSG_KROUTE_GET,
+ 	IMSG_IFINFO,
++	IMSG_IFADD,
++	IMSG_IFDELETE,
+ 	IMSG_NEIGHBOR_UP,
+ 	IMSG_NEIGHBOR_DOWN,
+ 	IMSG_NEIGHBOR_CHANGE,
+@@ -143,7 +144,6 @@ enum imsg_type {
+ 	IMSG_ABR_DOWN,
+ 	IMSG_RECONF_CONF,
+ 	IMSG_RECONF_AREA,
+-	IMSG_RECONF_IFACE,
+ 	IMSG_RECONF_END,
+ 	IMSG_DEMOTE
+ };
+@@ -322,10 +332,10 @@ struct iface {
+ 	struct in6_addr		 addr;
+ 	struct in6_addr		 dst;
+ 	struct in_addr		 abr_id;
++	struct in_addr		 area_id;
+ 	struct nbr		*dr;	/* designated router */
+ 	struct nbr		*bdr;	/* backup designated router */
+ 	struct nbr		*self;
+-	struct area		*area;
+ 
+ 	u_int64_t		 baudrate;
+ 	u_int32_t		 ls_ack_cnt;
+@@ -344,7 +354,11 @@ struct iface {
+ 	u_int8_t		 media_type;
+ 	u_int8_t		 linkstate;
+ 	u_int8_t		 priority;
+-	u_int8_t		 passive;
++	u_int8_t		 nh_reachable;
++	u_int8_t		 cflags;
++#define F_IFACE_PASSIVE		0x01
++#define F_IFACE_CONFIGURED	0x02
++#define F_IFACE_AVAIL		0x04
+ };
+ 
+ /* ospf_conf */
+@@ -452,7 +448,7 @@ struct ctl_iface {
+ 	struct in6_addr		 bdr_addr;
+ 	time_t			 hello_timer;
+ 	time_t			 uptime;
+-	u_int32_t		 baudrate;
++	u_int64_t		 baudrate;
+ 	u_int32_t		 dead_interval;
+ 	unsigned int		 ifindex;
+ 	int			 state;
+diff --git a/usr.sbin/ospf6d/ospfe.c b/usr.sbin/ospf6d/ospfe.c
+index f3bdeab6095..475516833a3 100644
+--- a/usr.sbin/ospf6d/ospfe.c
++++ b/usr.sbin/ospf6d/ospfe.c
+@@ -46,6 +46,7 @@
+ void		 ospfe_sig_handler(int, short, void *);
+ void		 ospfe_shutdown(void);
+ void		 orig_rtr_lsa_all(struct area *);
++void		 orig_rtr_lsa_area(struct area *);
+ struct iface	*find_vlink(struct abr_rtr *);
+ 
+ struct ospfd_conf	*oeconf = NULL, *nconf;
+@@ -181,13 +182,8 @@ ospfe(struct ospfd_conf *xconf, int pipe_parent2ospfe[2], int pipe_ospfe2rde[2],
+ 	/* start interfaces */
+ 	LIST_FOREACH(area, &oeconf->area_list, entry) {
+ 		ospfe_demote_area(area, 0);
+-		LIST_FOREACH(iface, &area->iface_list, entry) {
+-			if_init(xconf, iface);
+-			if (if_fsm(iface, IF_EVT_UP)) {
+-				log_debug("error starting interface %s",
+-				    iface->name);
+-			}
+-		}
++		LIST_FOREACH(iface, &area->iface_list, entry)
++			if_start(xconf, iface);
+ 	}
+ 
+ 	event_dispatch();
+@@ -253,10 +249,9 @@ ospfe_dispatch_main(int fd, short event, void *bula)
+ 	static struct iface	*niface;
+ 	struct imsg	 imsg;
+ 	struct imsgbuf  *ibuf = bula;
+-	struct area	*area = NULL;
+-	struct iface	*iface = NULL;
+-	struct kif	*kif;
+-	int		 n, link_ok, stub_changed, shut = 0;
++	struct iface	*iface, *ifp;
++	int		 n, stub_changed, shut = 0;
++	unsigned int	 ifindex;
+ 
+ 	switch (event) {
+ 	case EV_READ:
+@@ -283,39 +278,50 @@ ospfe_dispatch_main(int fd, short event, void *bula)
+ 		switch (imsg.hdr.type) {
+ 		case IMSG_IFINFO:
+ 			if (imsg.hdr.len != IMSG_HEADER_SIZE +
+-			    sizeof(struct kif))
++			    sizeof(struct iface))
+ 				fatalx("IFINFO imsg with wrong len");
+-			kif = imsg.data;
+-			link_ok = (kif->flags & IFF_UP) &&
+-			    (LINK_STATE_IS_UP(kif->link_state) ||
+-			    (kif->link_state == LINK_STATE_UNKNOWN &&
+-			    kif->media_type != IFT_CARP));
+-
+-			LIST_FOREACH(area, &oeconf->area_list, entry) {
+-				LIST_FOREACH(iface, &area->iface_list, entry) {
+-					if (kif->ifindex == iface->ifindex &&
+-					    iface->type !=
+-					    IF_TYPE_VIRTUALLINK) {
+-						iface->flags = kif->flags;
+-						iface->linkstate =
+-						    kif->link_state;
+-
+-						if (link_ok) {
+-							if_fsm(iface,
+-							    IF_EVT_UP);
+-							log_warnx("interface %s"
+-							    " up", iface->name);
+-						} else {
+-							if_fsm(iface,
+-							    IF_EVT_DOWN);
+-							log_warnx("interface %s"
+-							    " down",
+-							    iface->name);
+-						}
+-					}
+-				}
++			ifp = imsg.data;
++
++			iface = if_find(ifp->ifindex);
++			if (iface == NULL)
++				fatalx("interface lost in ospfe");
++			iface->flags = ifp->flags;
++			iface->linkstate = ifp->linkstate;
++			iface->nh_reachable = ifp->nh_reachable;
++
++			if (iface->nh_reachable) {
++				if_fsm(iface, IF_EVT_UP);
++				log_warnx("interface %s up", iface->name);
++			} else {
++				if_fsm(iface, IF_EVT_DOWN);
++				log_warnx("interface %s down", iface->name);
+ 			}
+ 			break;
++		case IMSG_IFADD:
++			if ((niface = malloc(sizeof(struct iface))) == NULL)
++				fatal(NULL);
++			memcpy(niface, imsg.data, sizeof(struct iface));
++
++			LIST_INIT(&niface->nbr_list);
++			TAILQ_INIT(&niface->ls_ack_list);
++			RB_INIT(&niface->lsa_tree);
++
++			narea = area_find(oeconf, niface->area_id);
++			LIST_INSERT_HEAD(&narea->iface_list, niface, entry);
++			break;
++		case IMSG_IFDELETE:
++			if (imsg.hdr.len != IMSG_HEADER_SIZE +
++			    sizeof(ifindex))
++				fatalx("IFINFO imsg with wrong len");
++
++			memcpy(&ifindex, imsg.data, sizeof(ifindex));
++			iface = if_find(ifindex);
++			if (iface == NULL)
++				fatalx("interface lost in ospfe");
++
++			LIST_REMOVE(iface, entry);
++			if_del(iface);
++			break;
+ 		case IMSG_RECONF_CONF:
+ 			if ((nconf = malloc(sizeof(struct ospfd_conf))) ==
+ 			    NULL)
+@@ -336,18 +342,6 @@ ospfe_dispatch_main(int fd, short event, void *bula)
+ 
+ 			LIST_INSERT_HEAD(&nconf->area_list, narea, entry);
+ 			break;
+-		case IMSG_RECONF_IFACE:
+-			if ((niface = malloc(sizeof(struct iface))) == NULL)
+-				fatal(NULL);
+-			memcpy(niface, imsg.data, sizeof(struct iface));
+-
+-			LIST_INIT(&niface->nbr_list);
+-			TAILQ_INIT(&niface->ls_ack_list);
+-			RB_INIT(&niface->lsa_tree);
+-
+-			niface->area = narea;
+-			LIST_INSERT_HEAD(&narea->iface_list, niface, entry);
+-			break;
+ 		case IMSG_RECONF_END:
+ 			if ((oeconf->flags & OSPFD_FLAG_STUB_ROUTER) !=
+ 			    (nconf->flags & OSPFD_FLAG_STUB_ROUTER))
+@@ -361,7 +355,6 @@ ospfe_dispatch_main(int fd, short event, void *bula)
+ 			break;
+ 		case IMSG_CTL_KROUTE:
+ 		case IMSG_CTL_KROUTE_ADDR:
+-		case IMSG_CTL_IFINFO:
+ 		case IMSG_CTL_END:
+ 			control_imsg_relay(&imsg);
+ 			break;
+@@ -494,7 +487,9 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
+ 				 * flood on all area interfaces on
+ 				 * area 0.0.0.0 include also virtual links.
+ 				 */
+-				area = nbr->iface->area;
++				if ((area = area_find(oeconf,
++				    nbr->iface->area_id)) == NULL)
++					fatalx("interface lost area");
+ 				LIST_FOREACH(iface, &area->iface_list, entry) {
+ 					noack += lsa_flood(iface, nbr,
+ 					    &lsa_hdr, imsg.data);
+@@ -662,7 +657,7 @@ find_vlink(struct abr_rtr *ar)
+ 			if (iface->abr_id.s_addr == ar->abr_id.s_addr &&
+ 			    iface->type == IF_TYPE_VIRTUALLINK &&
+ //XXX			    iface->area->id.s_addr == ar->area.s_addr) {
+-			    iface->area->id.s_addr == ar->area.s_addr) {
++			    iface->area_id.s_addr == ar->area.s_addr) {
+ //XXX				iface->dst.s_addr = ar->dst_ip.s_addr;
+ 				iface->dst = ar->dst_ip;
+ //XXX				iface->addr.s_addr = ar->addr.s_addr;
+@@ -686,11 +681,21 @@ orig_rtr_lsa_all(struct area *area)
+ 	 */
+ 	LIST_FOREACH(a, &oeconf->area_list, entry)
+ 		if (a != area)
+-			orig_rtr_lsa(a);
++			orig_rtr_lsa_area(a);
++}
++
++void
++orig_rtr_lsa(struct iface *iface)
++{
++	struct area	*area;
++
++	if ((area = area_find(oeconf, iface->area_id)) == NULL)
++		fatalx("interface lost area");
++	orig_rtr_lsa_area(area);
+ }
+ 
+ void
+-orig_rtr_lsa(struct area *area)
++orig_rtr_lsa_area(struct area *area)
+ {
+ #if 0 /* XXX needs work */
+ 	struct lsa_hdr		 lsa_hdr;
+diff --git a/usr.sbin/ospf6d/ospfe.h b/usr.sbin/ospf6d/ospfe.h
+index 244022796d7..0a7b8100f18 100644
+--- a/usr.sbin/ospf6d/ospfe.h
++++ b/usr.sbin/ospf6d/ospfe.h
+@@ -119,7 +119,7 @@ u_int32_t	 ospfe_router_id(void);
+ void		 ospfe_fib_update(int);
+ void		 ospfe_iface_ctl(struct ctl_conn *, unsigned int);
+ void		 ospfe_nbr_ctl(struct ctl_conn *);
+-void		 orig_rtr_lsa(struct area *);
++void		 orig_rtr_lsa(struct iface *);
+ void		 orig_net_lsa(struct iface *);
+ void		 ospfe_demote_area(struct area *, int);
+ void		 ospfe_demote_iface(struct iface *, int);
+@@ -127,9 +127,8 @@ void		 ospfe_demote_iface(struct iface *, int);
+ /* interface.c */
+ int		 if_fsm(struct iface *, enum iface_event);
+ 
+-struct iface	*if_new(struct kif *, struct kif_addr *);
+ void		 if_del(struct iface *);
+-void		 if_init(struct ospfd_conf *, struct iface *);
++void		 if_start(struct ospfd_conf *, struct iface *);
+ 
+ int		 if_act_start(struct iface *);
+ int		 if_act_elect(struct iface *);
+diff --git a/usr.sbin/ospf6d/packet.c b/usr.sbin/ospf6d/packet.c
+index 410fa7ca208..2f549e82466 100644
+--- a/usr.sbin/ospf6d/packet.c
++++ b/usr.sbin/ospf6d/packet.c
+@@ -53,7 +53,7 @@ gen_ospf_hdr(struct buf *buf, struct iface *iface, u_int8_t type)
+ 	ospf_hdr.type = type;
+ 	ospf_hdr.rtr_id = ospfe_router_id();
+ 	if (iface->type != IF_TYPE_VIRTUALLINK)
+-		ospf_hdr.area_id = iface->area->id.s_addr;
++		ospf_hdr.area_id = iface->area_id.s_addr;
+ 	ospf_hdr.instance = DEFAULT_INSTANCE_ID;
+ 	ospf_hdr.zero = 0;		/* must be zero */
+ 
+@@ -259,7 +259,7 @@ ospf_hdr_sanity_check(struct ospf_hdr *ospf_hdr, u_int16_t len,
+ 	}
+ 
+ 	if (iface->type != IF_TYPE_VIRTUALLINK) {
+-		if (ospf_hdr->area_id != iface->area->id.s_addr) {
++		if (ospf_hdr->area_id != iface->area_id.s_addr) {
+ 			id.s_addr = ospf_hdr->area_id;
+ 			log_debug("recv_packet: invalid area ID %s, "
+ 			    "interface %s", inet_ntoa(id), iface->name);
+@@ -305,12 +305,12 @@ find_iface(struct ospfd_conf *xconf, unsigned int ifindex, struct in6_addr *src)
+ 			switch (iface->type) {
+ 			case IF_TYPE_VIRTUALLINK:
+ 				if (IN6_ARE_ADDR_EQUAL(src, &iface->dst) &&
+-				    !iface->passive)
++				    !(iface->cflags & F_IFACE_PASSIVE))
+ 					return (iface);
+ 				break;
+ 			default:
+ 				if (ifindex == iface->ifindex &&
+-				    !iface->passive)
++				    !(iface->cflags & F_IFACE_PASSIVE))
+ 					match = iface;
+ 				break;
+ 			}
+diff --git a/usr.sbin/ospf6d/parse.y b/usr.sbin/ospf6d/parse.y
+index 5235bf2821e..0bc09123b30 100644
+--- a/usr.sbin/ospf6d/parse.y
++++ b/usr.sbin/ospf6d/parse.y
+@@ -101,7 +101,6 @@ struct config_defaults	 ifacedefs;
+ struct config_defaults	*defs;
+ 
+ struct area	*conf_get_area(struct in_addr);
+-struct iface	*conf_get_if(struct kif *, struct kif_addr *);
+ 
+ typedef struct {
+ 	union {
+@@ -436,24 +435,18 @@ areaoptsl	: interface
+ 		;
+ 
+ interface	: INTERFACE STRING	{
+-			struct kif	*kif;
+-			struct kif_addr	*ka = NULL;
+-
+-			if ((kif = kif_findname($2, &ka)) == NULL) {
++			if ((iface = if_findname($2)) == NULL) {
+ 				yyerror("unknown interface %s", $2);
+ 				free($2);
+ 				YYERROR;
+ 			}
+-			if (ka == NULL) {
++			if (IN6_IS_ADDR_UNSPECIFIED(&iface->addr)) {
+ 				yyerror("unnumbered interface %s", $2);
+ 				free($2);
+ 				YYERROR;
+ 			}
+ 			free($2);
+-			iface = conf_get_if(kif, ka);
+-			if (iface == NULL)
+-				YYERROR;
+-			iface->area = area;
++			iface->area_id.s_addr = area->id.s_addr;
+ 			LIST_INSERT_HEAD(&area->iface_list, iface, entry);
+ 
+ 			memcpy(&ifacedefs, defs, sizeof(ifacedefs));
+@@ -465,6 +458,7 @@ interface	: INTERFACE STRING	{
+ 			iface->rxmt_interval = defs->rxmt_interval;
+ 			iface->metric = defs->metric;
+ 			iface->priority = defs->priority;
++			iface->cflags |= F_IFACE_CONFIGURED;
+ 			iface = NULL;
+ 			/* interface is always part of an area */
+ 			defs = &areadefs;
+@@ -480,7 +474,7 @@ interfaceopts_l	: interfaceopts_l interfaceoptsl nl
+ 		| interfaceoptsl optnl
+ 		;
+ 
+-interfaceoptsl	: PASSIVE		{ iface->passive = 1; }
++interfaceoptsl	: PASSIVE		{ iface->cflags |= F_IFACE_PASSIVE; }
+ 		| DEMOTE STRING		{
+ 			if (strlcpy(iface->demote_group, $2,
+ 			    sizeof(iface->demote_group)) >=
+@@ -1020,26 +1014,6 @@ conf_get_area(struct in_addr id)
+ 	return (a);
+ }
+ 
+-struct iface *
+-conf_get_if(struct kif *kif, struct kif_addr *ka)
+-{
+-	struct area	*a;
+-	struct iface	*i;
+-
+-	LIST_FOREACH(a, &conf->area_list, entry)
+-		LIST_FOREACH(i, &a->iface_list, entry)
+-			if (i->ifindex == kif->ifindex /*&& XXX
+-			    i->addr.s_addr == ka->addr.s_addr*/) {
+-				yyerror("interface %s already configured",
+-				    kif->ifname);
+-				return (NULL);
+-			}
+-
+-	i = if_new(kif, ka);
+-
+-	return (i);
+-}
+-
+ void
+ clear_config(struct ospfd_conf *xconf)
+ {
+diff --git a/usr.sbin/ospf6d/printconf.c b/usr.sbin/ospf6d/printconf.c
+index b4425b3176b..26a9f3500d9 100644
+--- a/usr.sbin/ospf6d/printconf.c
++++ b/usr.sbin/ospf6d/printconf.c
+@@ -112,7 +112,7 @@ print_iface(struct iface *iface)
+ 	printf("\t\thello-interval %d\n", iface->hello_interval);
+ 	printf("\t\tmetric %d\n", iface->metric);
+ 
+-	if (iface->passive)
++	if (iface->cflags & F_IFACE_PASSIVE)
+ 		printf("\t\tpassive\n");
+ 	if (*iface->demote_group)
+ 		printf("\t\tdemote %s\n", iface->demote_group);
+diff --git a/usr.sbin/ospf6d/rde.c b/usr.sbin/ospf6d/rde.c
+index 99656a614d6..f9619012346 100644
+--- a/usr.sbin/ospf6d/rde.c
++++ b/usr.sbin/ospf6d/rde.c
+@@ -561,7 +561,7 @@ void
+ rde_dispatch_parent(int fd, short event, void *bula)
+ {
+ 	static struct area	*narea;
+-	struct iface		*niface;
++	struct iface		*niface, *iface;
+ 	struct imsg		 imsg;
+ 	struct kroute		 kr;
+ 	struct rroute		 rr;
+diff --git a/usr.sbin/ospf6d/rde_lsdb.c b/usr.sbin/ospf6d/rde_lsdb.c
+index 1880f7d844f..a16682a08d4 100644
+--- a/usr.sbin/ospf6d/rde_lsdb.c
++++ b/usr.sbin/ospf6d/rde_lsdb.c
+@@ -38,6 +38,8 @@ int		 lsa_get_prefix(void *, u_int16_t, struct lsa_prefix *);
+ 
+ RB_GENERATE(lsa_tree, vertex, entry, lsa_compare)
+ 
++extern struct ospfd_conf	*rdeconf;
++
+ void
+ lsa_init(struct lsa_tree *t)
+ {
+@@ -516,9 +518,13 @@ lsa_find(struct iface *iface, u_int16_t type, u_int32_t ls_id,
+ 
+ 	if (LSA_IS_SCOPE_AS(key.type))
+ 		tree = &asext_tree;
+-	else if (LSA_IS_SCOPE_AREA(key.type))
+-		tree = &iface->area->lsa_tree;
+-	else if (LSA_IS_SCOPE_LLOCAL(key.type))
++	else if (LSA_IS_SCOPE_AREA(key.type)) {
++		struct area	*area;
++
++		if ((area = area_find(rdeconf, iface->area_id)) == NULL)
++			fatalx("interface lost area");
++		tree = &area->lsa_tree;
++	} else if (LSA_IS_SCOPE_LLOCAL(key.type))
+ 		tree = &iface->lsa_tree;
+ 	else
+ 		fatalx("unknown scope type");
